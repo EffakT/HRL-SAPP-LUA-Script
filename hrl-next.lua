@@ -16,13 +16,12 @@ last_ping_check = 0
 ping_threshold = 100
 player_ping_stability = {}
 
--- SEC-01 (docs/security.md) — HRL query verification. hrl.effakt.info's webhook cross-checks
--- every lap submission against a live UDP \query response from this same server, requiring
--- these hrl_* fields alongside the standard query fields, plus the matching hrl_token in the
--- HTTP submission body. Not a durable secret (query responses are publicly readable by anyone
--- who queries the server) — just binds "this HTTP submission" to "this server is actually
--- running an HRL-aware script right now," so hrl_token only needs to be unpredictable and
--- rotated, not cryptographically secret.
+-- HRL query verification. hrl.effakt.info's webhook cross-checks every lap submission against
+-- a live UDP \query response from this same server, requiring these hrl_* fields alongside the
+-- standard query fields, plus the matching hrl_token in the HTTP submission body. Not a durable
+-- secret (query responses are publicly readable by anyone who queries the server) - just binds
+-- "this HTTP submission" to "this server is actually running an HRL-aware script right now," so
+-- hrl_token only needs to be unpredictable and rotated, not cryptographically secret.
 local HRL_PROTOCOL = "1"
 local HRL_TOKEN_ROTATE_INTERVAL_SECONDS = 300
 local hrl_token = nil
@@ -30,17 +29,12 @@ local hrl_token_prev = nil
 local hrl_token_last_rotated = 0
 
 ffi = require("ffi")
--- ffi.cdef [[
---     typedef void http_response;
---     http_response *http_post(const char *url, const char *json);
--- ]]
--- http_client = ffi.load("hrl_api")
 
 ffi.cdef[[
-void http_post(uint32_t id, const char* url, const char* body);
-char* http_poll(uint32_t* out_id);
-void http_free(char* ptr);
-bool http_active();
+    void http_post(uint32_t id, const char* url, const char* body);
+    char* http_poll(uint32_t* out_id);
+    void http_free(char* ptr);
+    bool http_active();
 ]]
 
 local http_client = ffi.load("halo_http")
@@ -102,8 +96,8 @@ local function get_time()
     return tonumber(get_var(1, "$ticks")) / 30
 end
 
--- SEC-01 (docs/security.md) — a short, unpredictable-enough token; freshness/rotation is what
--- matters here, not cryptographic strength (see the block comment above where these are declared).
+-- A short, unpredictable-enough token; freshness/rotation is what matters here, not cryptographic
+-- strength (see the block comment above where these are declared).
 local function random_hex(length)
     local chars = "0123456789abcdef"
     local out = {}
@@ -116,8 +110,8 @@ end
 
 -- Publishes the current hrl_* fields via SAPP's query_add console command (run through
 -- execute_command, same as every other console-command invocation from Lua) so the webhook's
--- live UDP \query cross-check can read them. hrl_token_prev is always published too — an
--- empty string when there isn't one yet — so a submission racing a rotation boundary against
+-- live UDP \query cross-check can read them. hrl_token_prev is always published too - an
+-- empty string when there isn't one yet - so a submission racing a rotation boundary against
 -- the *previous* token still verifies (LapSubmissionVerifier accepts either).
 local function PublishHrlQueryFields()
     execute_command("query_add hrl_enabled 1")
@@ -129,19 +123,19 @@ end
 function RotateHrlToken()
     hrl_token_prev = hrl_token
     hrl_token = random_hex(32)
-    -- os.time() (wall clock), not get_time() ($ticks/30) — SITE_AUDIT.md's Lua review caught
-    -- that $ticks is match-relative (resets on every map/game transition), which would make
-    -- `now - hrl_token_last_rotated` go negative across a map change and stall rotation
-    -- indefinitely. os.time() is monotonic across map transitions (already used for the
-    -- initial math.randomseed()), so this survives them correctly.
+    -- os.time() (wall clock), not get_time() ($ticks/30) $ticks are match-relative
+    -- (resets on every map/game transition), which would make `now - hrl_token_last_rotated`
+    -- go negative across a map change and stall rotation indefinitely. os.time() is monotonic 
+    -- cross map transitions (already used for the initial math.randomseed()), so this survives
+    -- them correctly.
     hrl_token_last_rotated = os.time()
     PublishHrlQueryFields()
 end
 
--- Fresh per submission — this script doesn't itself retry a timed-out request (see
+-- Fresh per submission - this script doesn't itself retry a timed-out request (see
 -- pollHttpResponses's timeout handling, which just logs and drops it), so there's no need for
 -- submission_id to stay stable across attempts; it only needs to uniquely identify one actual
--- HTTP POST for the webhook's idempotency guard (docs/security.md).
+-- HTTP POST for the webhook's idempotency guard.
 local function GenerateSubmissionId(playerIndex)
     return string.format("%d-%d-%d", math.floor(get_time() * 1000), playerIndex, math.random(100000, 999999999))
 end
@@ -214,7 +208,7 @@ function OnScriptLoad()
         player_ping_stability[i] = {}
     end
 
-    -- SEC-01 (docs/security.md) — seed once per script load, then rotate on a timer (OnTick).
+    -- Seed once per script load, then rotate on a timer (OnTick).
     math.randomseed(os.time())
     RotateHrlToken()
 
@@ -338,8 +332,8 @@ function logTime(playerIndex, best_time)
         map_label = "",
         race_type = mode,
         player_time = best_time,
-        -- SEC-01 (docs/security.md) — must match the hrl_token this same server is currently
-        -- publishing via query_add, and submission_id is this exact HTTP POST's idempotency key.
+        -- Must match the hrl_token this same server is currently publishing via query_add, and
+        -- submission_id is this exact HTTP POST's idempotency key.
         hrl_token = hrl_token,
         submission_id = GenerateSubmissionId(playerIndex)
     }
@@ -457,10 +451,6 @@ function OnGameEnd()
 end
 
 function OnScriptUnload()
-    -- SITE_AUDIT.md's Lua review caught this as empty — without it, a stopped script leaves
-    -- the hrl_* query fields in place, so the UDP \query response keeps claiming HRL is active
-    -- (and the last-known token still verifies) even though nothing is actually submitting laps
-    -- anymore. SAPP's query_del accepts the field name directly (confirmed via SAPP's own docs).
     execute_command("query_del hrl_enabled")
     execute_command("query_del hrl_protocol")
     execute_command("query_del hrl_token")
@@ -477,9 +467,7 @@ function OnTick()
         pollHttpResponses()
     end
 
-    -- SEC-01 (docs/security.md) — periodic token rotation, not tied to any game event. Compared
-    -- against os.time() (wall clock), matching what RotateHrlToken() now stores — see the
-    -- SITE_AUDIT.md-caught bug explained there about $ticks resetting per map.
+    -- Periodic token rotation, not tied to any game event. Compared against os.time() (wall clock), matching what RotateHrlToken() now stores
     if os.time() - hrl_token_last_rotated >= HRL_TOKEN_ROTATE_INTERVAL_SECONDS then
         RotateHrlToken()
     end
