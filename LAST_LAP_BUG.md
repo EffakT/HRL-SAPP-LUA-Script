@@ -26,4 +26,4 @@ This explains why it's specifically the *last* lap that's affected, rather than 
 ## Not investigated / not fixed
 
 - Exact firing order of `EVENT_SCORE` vs `EVENT_GAME_END` in the underlying SAPP/Halo engine (would need to confirm empirically or in SAPP's docs).
-- Whether the fix should be "finalize/flush any in-progress score before resetting" in `OnGameEnd`, "defer the reset by a tick," or something else - deliberately not designed here per request.
+- Whether the fix should be "finalize/flush any in-progress score before resetting" in `OnGameEnd`, "defer the reset by a tick," or something else .
