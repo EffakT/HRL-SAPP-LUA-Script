@@ -10,6 +10,11 @@ api_version = "1.11.0.0"
 
 debug = 0
 
+-- Ping-spike (warp) detection: compare each check against an EMA-smoothed baseline
+-- (CONSTANTS.PING_EMA_ALPHA/PING_EMA_SPIKE_THRESHOLD) instead of the previous raw sample
+-- (CONSTANTS.PING_THRESHOLD). Toggle here to A/B the two without editing PingChecker itself.
+ping_ema_enabled = false
+
 -- =============================================================================
 -- FFI & JSON Setup
 -- =============================================================================
@@ -59,6 +64,8 @@ local CONSTANTS = {
     PING_CHECK_INTERVAL = 30,
     RACE_GLOBALS_OFFSET = 0x44,
     PING_THRESHOLD = 100,
+    PING_EMA_ALPHA = 0.15,
+    PING_EMA_SPIKE_THRESHOLD = 35,
     REQUEST_TIMEOUT_SECONDS = 5,
     HRL_TOKEN_ROTATE_INTERVAL_SECONDS = 300,
     HRL_PROTOCOL = "1",
@@ -776,6 +783,7 @@ function PingChecker:new()
     local obj = {
         last_ping_check = 0,
         player_ping = {},
+        ema_ping = {},  -- Only populated/consulted when ping_ema_enabled is true
     }
     for i = 1, CONSTANTS.MAX_PLAYERS do
         obj.player_ping[i] = 0
@@ -787,8 +795,16 @@ end
 function PingChecker:reset()
     for i = 1, CONSTANTS.MAX_PLAYERS do
         self.player_ping[i] = 0
+        self.ema_ping[i] = nil
     end
     self.last_ping_check = 0
+end
+
+-- Clears one player's baseline without disturbing anyone else's (join/rejoin) so a
+-- reused player slot doesn't inherit the previous occupant's raw ping or EMA baseline.
+function PingChecker:reset_player(playerIndex)
+    self.player_ping[playerIndex] = self:get_player_ping(playerIndex)
+    self.ema_ping[playerIndex] = nil
 end
 
 function PingChecker:get_player_ping(playerIndex)
@@ -796,6 +812,23 @@ function PingChecker:get_player_ping(playerIndex)
         return tonumber(get_var(playerIndex, "$ping")) or 0
     end
     return 0
+end
+
+-- Decides whether this tick's ping counts as a spike, and returns the updated EMA baseline
+-- to store. Computes the delta against the OLD baseline before folding this sample in -
+-- comparing against the already-updated baseline would understate the true jump by
+-- (1 - PING_EMA_ALPHA), since it'd already include a slice of the very sample being tested.
+function PingChecker:check_ema_spike(playerIndex, ping)
+    local ema = self.ema_ping[playerIndex]
+    local is_spike = false
+
+    if ema then
+        local delta = math.floor(ping - ema + 0.5)
+        is_spike = delta >= CONSTANTS.PING_EMA_SPIKE_THRESHOLD
+    end
+
+    local updated_ema = ema and (ema * (1 - CONSTANTS.PING_EMA_ALPHA) + ping * CONSTANTS.PING_EMA_ALPHA) or ping
+    return is_spike, updated_ema
 end
 
 function PingChecker:check(lap_tracker)
@@ -808,9 +841,18 @@ function PingChecker:check(lap_tracker)
     for i = 1, CONSTANTS.MAX_PLAYERS do
         if player_present(i) then
             local ping = self:get_player_ping(i)
-            local prev_ping = self.player_ping[i]
+            local is_spike
 
-            if prev_ping and prev_ping > 0 and (ping - prev_ping) > CONSTANTS.PING_THRESHOLD then
+            if ping_ema_enabled then
+                local updated_ema
+                is_spike, updated_ema = self:check_ema_spike(i, ping)
+                self.ema_ping[i] = updated_ema
+            else
+                local prev_ping = self.player_ping[i]
+                is_spike = prev_ping and prev_ping > 0 and (ping - prev_ping) > CONSTANTS.PING_THRESHOLD
+            end
+
+            if is_spike then
                 lap_tracker.players[i].warps = 1
                 say(i, "We just detected a ping spike. This lap will not count")
             end
@@ -931,7 +973,7 @@ function HRLApp:on_player_join(playerIndex)
     end
 
     self.lap_tracker:reset_player(playerIndex)
-    self.ping_checker.player_ping[playerIndex] = self.ping_checker:get_player_ping(playerIndex)
+    self.ping_checker:reset_player(playerIndex)
 
     say(playerIndex, "This server runs Halo Race Leaderboard.")
     say(playerIndex, "For more information, or to see the leaderboard, go to hrl.effakt.info")
