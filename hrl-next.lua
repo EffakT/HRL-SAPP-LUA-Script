@@ -961,6 +961,14 @@ function HRLApp:on_game_end()
     -- Submit pending laps BEFORE resetting state
     self.lap_tracker:on_game_end(now)
 
+    -- Stop ping-spike watching (and checkpoint tracking) until the next game actually
+    -- starts - otherwise players get warned for a "ping spike" during the post-game
+    -- PGCR/lobby, when no lap is even being timed. on_game_start's ping_checker:reset()
+    -- (plus its baseline re-priming loop) means re-enabling this later is always a clean
+    -- start, not a stale comparison against pre-PGCR readings.
+    self.game_started = false
+    self.lap_tracker:set_game_started(false)
+
     -- Only reset if not race or mode == 2 (per original logic)
     if not self.race or self.mode == 2 then
         return false
@@ -1002,7 +1010,7 @@ end
 function HRLApp:on_tick()
     local now = get_time()
 
-    if not self.allow_warps then
+    if not self.allow_warps and self.game_started then
         self.ping_checker:check(self.lap_tracker)
     end
 
