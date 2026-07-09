@@ -1,32 +1,18 @@
--- API Requests run through http instead of https due to dependency issue
-server_port = "2302" -- update this with your port. If port is invalid, your server will not be included.
+-- Halo Race Leaderboard (HRL) - Refactored
+-- Single-file, table-based module architecture for SAPP deployment
+-- Addresses: Final lap race condition, Rally lap submission, AnyOrder bitset tracking,
+--            HTTP request ID collision, tick-relative timeout bugs
+
+-- TODO: Find memory address for server_port to automate this step
+server_port = "2304" -- update this with your port. If port is invalid, your server will not be included.
 
 api_version = "1.11.0.0"
 
 debug = 0
 
-current_map = nil
-race = false
-mode = 0
-player_warps = {}
-game_started = false
-allow_warps = false
-player_ping = {}
-last_ping_check = 0
-ping_threshold = 100
-player_ping_stability = {}
-
--- HRL query verification. hrl.effakt.info's webhook cross-checks every lap submission against
--- a live UDP \query response from this same server, requiring these hrl_* fields alongside the
--- standard query fields, plus the matching hrl_token in the HTTP submission body. Not a durable
--- secret (query responses are publicly readable by anyone who queries the server) - just binds
--- "this HTTP submission" to "this server is actually running an HRL-aware script right now," so
--- hrl_token only needs to be unpredictable and rotated, not cryptographically secret.
-local HRL_PROTOCOL = "1"
-local HRL_TOKEN_ROTATE_INTERVAL_SECONDS = 300
-local hrl_token = nil
-local hrl_token_prev = nil
-local hrl_token_last_rotated = 0
+-- =============================================================================
+-- FFI & JSON Setup
+-- =============================================================================
 
 ffi = require("ffi")
 
@@ -46,684 +32,60 @@ if not json_file then
 end
 local json = json_file()
 
--- Constants
-local GAMETYPE_BASE_PC = 0x671340
-local GAMETYPE_BASE_CE = 0x5F5498
-local GAMETYPE_MODE_OFFSET_PC = 0x7C - 32
-local GAMETYPE_MODE_OFFSET_CE = 0x7C
-local PLAYER_VEHICLE_OFFSET = 0x11C
-local VEHICLE_DRIVER_OFFSET = 0x324
-local PLAYER_TIME_OFFSET = 0xC4
-local INVALID_OBJECT_ID = 0xFFFFFFFF
-local MAX_PLAYERS = 16
-local PING_CHECK_INTERVAL = 30
-local RACE_GLOBALS_OFFSET = 0x44  -- Checkpoint tracking offset
 
+-- =============================================================================
+-- Global Utility: Time
+-- =============================================================================
 
-local race_globals
-
-local active_requests = {}  -- player_index -> start_time
-local REQUEST_TIMEOUT_TICKS = 5 * 30   -- Seconds before considering a request stuck
-
--- Player checkpoint tracking
-local player_checkpoints = {}
-for i = 1, MAX_PLAYERS do
-    player_checkpoints[i] = {
-        current = 0,
-        previous = 0,
-        started = false,
-        start_checkpoint = 0,
-        started_time = nil,
-        checkpoints = {}
-    }
-end
-
--- API URLs
-local API_URLS = {
-    dev = {
-        -- newtime = "http://dev.haloraceleaderboard.effakt.info/api/newtime",
-        -- claimplayer = "http://dev.haloraceleaderboard.effakt.info/api/claimplayer"
-        newtime = "https://redesign.hrl.effakt.info/api/v1/laps",
-        claimplayer = "https://redesign.hrl.effakt.info/api/v1/claimplayer"
-    },
-    prod = {
-        newtime = "https://redesign.hrl.effakt.info/api/v1/laps",
-        claimplayer = "https://redesign.hrl.effakt.info/api/v1/claimplayer"
-    }
-}
-
-local function get_time()
+function get_time()
     return tonumber(get_var(1, "$ticks")) / 30
 end
 
--- A short, unpredictable-enough token; freshness/rotation is what matters here, not cryptographic
--- strength (see the block comment above where these are declared).
-local function random_hex(length)
-    local chars = "0123456789abcdef"
-    local out = {}
-    for i = 1, length do
-        local idx = math.random(1, #chars)
-        out[i] = chars:sub(idx, idx)
-    end
-    return table.concat(out)
-end
 
--- Publishes the current hrl_* fields via SAPP's query_add console command (run through
--- execute_command, same as every other console-command invocation from Lua) so the webhook's
--- live UDP \query cross-check can read them. hrl_token_prev is always published too - an
--- empty string when there isn't one yet - so a submission racing a rotation boundary against
--- the *previous* token still verifies (LapSubmissionVerifier accepts either).
-local function PublishHrlQueryFields()
-    execute_command("query_add hrl_enabled 1")
-    execute_command("query_add hrl_protocol " .. HRL_PROTOCOL)
-    execute_command("query_add hrl_token " .. hrl_token)
-    execute_command("query_add hrl_token_prev " .. (hrl_token_prev or ""))
-end
+-- =============================================================================
+-- Constants
+-- =============================================================================
 
-function RotateHrlToken()
-    hrl_token_prev = hrl_token
-    hrl_token = random_hex(32)
-    -- os.time() (wall clock), not get_time() ($ticks/30) $ticks are match-relative
-    -- (resets on every map/game transition), which would make `now - hrl_token_last_rotated`
-    -- go negative across a map change and stall rotation indefinitely. os.time() is monotonic 
-    -- cross map transitions (already used for the initial math.randomseed()), so this survives
-    -- them correctly.
-    hrl_token_last_rotated = os.time()
-    PublishHrlQueryFields()
-end
+local CONSTANTS = {
+    GAMETYPE_BASE_PC = 0x671340,
+    GAMETYPE_BASE_CE = 0x5F5498,
+    GAMETYPE_MODE_OFFSET_PC = 0x7C - 32,
+    GAMETYPE_MODE_OFFSET_CE = 0x7C,
+    PLAYER_VEHICLE_OFFSET = 0x11C,
+    VEHICLE_DRIVER_OFFSET = 0x324,
+    PLAYER_TIME_OFFSET = 0xC4,
+    INVALID_OBJECT_ID = 0xFFFFFFFF,
+    MAX_PLAYERS = 16,
+    PING_CHECK_INTERVAL = 30,
+    RACE_GLOBALS_OFFSET = 0x44,
+    PING_THRESHOLD = 100,
+    REQUEST_TIMEOUT_SECONDS = 5,
+    HRL_TOKEN_ROTATE_INTERVAL_SECONDS = 300,
+    HRL_PROTOCOL = "1",
+}
 
--- Fresh per submission - this script doesn't itself retry a timed-out request (see
--- pollHttpResponses's timeout handling, which just logs and drops it), so there's no need for
--- submission_id to stay stable across attempts; it only needs to uniquely identify one actual
--- HTTP POST for the webhook's idempotency guard.
-local function GenerateSubmissionId(playerIndex)
-    return string.format("%d-%d-%d", math.floor(get_time() * 1000), playerIndex, math.random(100000, 999999999))
-end
-
-
-function SendTime(URL, json, player_index)
-    --http_client.http_post_with_player(URL, json, player_index or -1)
-active_requests[player_index] = {
-        start_time = get_time(),
-        request_type = "newtime"
-    }  
-      http_client.http_post(player_index, URL, json)
-end
-
-function SendClaim(URL, json, player_index)
-active_requests[player_index] = {
-        start_time = get_time(),
-        request_type = "claimplayer"
+local API_URLS = {
+    dev = {
+        newtime = "http://redesign.hrl.effakt.info/api/v1/laps",
+        claimplayer = "http://redesign.hrl.effakt.info/api/v1/claimplayer"
+    },
+    prod = {
+        newtime = "http://redesign.hrl.effakt.info/api/v1/laps",
+        claimplayer = "http://redesign.hrl.effakt.info/api/v1/claimplayer"
     }
-        http_client.http_post(player_index, URL, json)
-end
+}
 
-function poll_http()
-    local id_buf = ffi.new("uint32_t[1]")
-    local ptr = http_client.http_poll(id_buf)
+-- =============================================================================
+-- Encoding Module: Windows-1252 <-> UTF-8
+-- =============================================================================
 
-    --print("polling for response")
-
-    if ptr ~= nil then
-        local body = ffi.string(ptr)
-        http_client.http_free(ptr)
-        
-        local escaped = body:gsub("\n", "\\n"):gsub("\r", "\\r")
-        -- print("DEBUG: id=" .. id_buf[0] .. " body=[" .. escaped .. "]")
-
-        return id_buf[0], body
-    end
-
-    return nil
-end
-
-local gametype_base = (halo_type == "PC") and GAMETYPE_BASE_PC or GAMETYPE_BASE_CE
-
-
-function OnScriptLoad()
-    -- local found_offset = find_ip_offset(known_ip)
-    -- TODO: Find this offset
-    --local server_ip = read_string(0x0063EE28)
-    --server_ip = get_var(0, "$ip")
-    
-    --server_ip = os.getenv("SERVER_IP") or "localhost"
-    --print("Server IP: " .. server_ip)
-    
-    race_globals = read_dword(sig_scan("BF??????00F3ABB952000000") + 0x1)
- 
-
-    register_callback(cb['EVENT_COMMAND'], "OnServerCommand")
-    register_callback(cb['EVENT_GAME_START'], "OnGameStart")
-    register_callback(cb['EVENT_GAME_END'], "OnGameEnd")
-    register_callback(cb['EVENT_JOIN'], "OnPlayerJoin")
-    register_callback(cb['EVENT_LEAVE'], 'OnPlayerQuit')
-    register_callback(cb['EVENT_WARP'], "OnWarp")
-    register_callback(cb['EVENT_TICK'], "OnTick")
-
-    CheckMapAndGametype(true)
-
-    for i = 1, MAX_PLAYERS do
-        player_warps[i] = 0
-        player_ping[i] = 0
-        player_ping_stability[i] = {}
-    end
-
-    -- Seed once per script load, then rotate on a timer (OnTick).
-    math.randomseed(os.time())
-    RotateHrlToken()
-
-    print("HRL Loaded")
-end
-
-local function tokenizestring(inputstr, sep)
-    sep = sep or "%s"
-    local t = {}
-    local i = 1
-    for str in string.gmatch(inputstr, "([^" .. sep .. "]+)") do
-        t[i] = str
-        i = i + 1
-    end
-    return t
-end
-
-function OnServerCommand(playerIndex, Command)
-    local t = tokenizestring(Command)
-    local cmd = t[1]
-    
-    if cmd == "claimplayer" then
-        claimPlayer(playerIndex, t[2])
-        return false
-    elseif debug == 1 and cmd == "logtime" then
-        logTime(1, t[2])
-        return false
-    end
-end
-
-function OnPlayerScore(playerIndex)
-    if not player_checkpoints[playerIndex].started then
-        return
-    end
-
-    --print(string.format("DEBUG: SCORE EVENT player %d", playerIndex))
-    player_ping_stability[playerIndex] = {}
-
-    local player_address = get_dynamic_player(playerIndex)
-    local vehicle_objectid = read_dword(player_address + PLAYER_VEHICLE_OFFSET)
-    local is_driver = true
-    local current_time = get_time()
-    
-    if tonumber(vehicle_objectid) ~= INVALID_OBJECT_ID then
-        --print(string.format("DEBUG: Player %d in vehicle %s", playerIndex, vehicle_objectid))
-        local vehicle = get_object_memory(tonumber(vehicle_objectid))
-        local driver = get_object_memory(read_dword(vehicle + VEHICLE_DRIVER_OFFSET))
-        is_driver = (driver == player_address)
-    end
-    
-    --print(string.format("DEBUG: Player %d is_driver=%s, warps=%d", 
-    --    playerIndex, tostring(is_driver), player_warps[playerIndex]))
-    
-    if is_driver and player_warps[playerIndex] == 0 then
-        --print(string.format("DEBUG: Player %d LOGGING TIME", playerIndex))
-        
-        -- Finalize any remaining checkpoints before logging the time
-        local checkpoint_data = player_checkpoints[playerIndex]
-        if checkpoint_data and checkpoint_data.checkpoints then
-            local last_cp = checkpoint_data.checkpoints[#checkpoint_data.checkpoints]
-            if last_cp and last_cp.end_time == nil then
-                last_cp.end_time = current_time
-                -- Display final split if it's not checkpoint 0
-                if last_cp.checkpoint_id ~= 0 then
-                    local split_duration = last_cp.end_time - last_cp.start
-                    say(playerIndex, string.format("CP %d->Finish - Split: %.2f sec", last_cp.checkpoint_id, split_duration))
-                end
-            end
-        end
-        
-        local player = get_player(playerIndex)
-        -- local best_time = read_word(player + PLAYER_TIME_OFFSET) / 30
-        -- local best_time = current_time - player_checkpoints[playerIndex].started_time
-        local start_time = player_checkpoints[playerIndex].started_time
-        if not start_time then
-            return
-        end
-        local best_time = current_time - start_time
-
-        logTime(playerIndex, best_time)
-    elseif player_warps[playerIndex] == 1 then
-        --print(string.format("DEBUG: Player %d has warps, rejecting", playerIndex))
-        say(playerIndex, "We detected a warp or a lag spike, your lap time was not recorded")
-    end
-
-
-
-    player_warps[playerIndex] = 0
-end
-
-function claimPlayer(playerIndex, claim_code)
-    local player_hash = get_var(playerIndex, "$hash")
-    
-    local data = {
-        player_hash = player_hash,
-        code = claim_code
-    }
-    
-    if debug == 1 then
-        data.test = true
-    end
-    
-    local json_str = json:encode(data)
-    --print(json_str)
-    
-    local api_env = debug == 1 and "dev" or "prod"
-    say(playerIndex, "Your player claim request has been submitted.")
-    SendClaim(API_URLS[api_env].claimplayer, json_str, playerIndex)
-end
-
-function logTime(playerIndex, best_time)
-    local player_hash = get_var(playerIndex, "$hash")
-    local current_name = string.toutf8(get_var(playerIndex, "$name"))
-    local is_debug = debug == 1
-    
-    local data = {
-        port = server_port,
-        player_hash = player_hash,
-        player_name = current_name,
-        map_name = current_map,
-        map_label = "",
-        race_type = mode,
-        player_time = best_time,
-        -- Must match the hrl_token this same server is currently publishing via query_add, and
-        -- submission_id is this exact HTTP POST's idempotency key.
-        hrl_token = hrl_token,
-        submission_id = GenerateSubmissionId(playerIndex)
-    }
-
-    -- Attach splits if available
-    local cp_data = player_checkpoints[playerIndex] and player_checkpoints[playerIndex].checkpoints
-    if cp_data and #cp_data > 0 then
-        local splits = {}
-        for _, entry in ipairs(cp_data) do
-            if entry and entry.checkpoint_id and entry.checkpoint_id ~= 0 and entry.start and entry.end_time then
-                table.insert(splits, {
-                    checkpoint_id = entry.checkpoint_id,
-                    startTime = entry.start,
-                    endTime = entry.end_time,
-                    duration = entry.end_time - entry.start
-                })
-            end
-        end
-        if #splits > 0 then
-            data.splits = splits
-        end
-    end
-    
-    if is_debug then
-        data.test = "true"
-    end
-    
-    local json_str = json:encode(data)
-    print(json_str)
-    
-    local api_env = is_debug and "dev" or "prod"
-    --if is_debug then
-        say(playerIndex, "Your time of " .. best_time .. " has been recorded.")
-    --end
-
-    SendTime(API_URLS[api_env].newtime, json_str, playerIndex)
-end
-
-function OnWarp(PlayerIndex)
-    if not allow_warps then
-        player_warps[PlayerIndex] = 1
-        say(PlayerIndex, "We just detected a warp. This lap will not count")
-    end
-end
-
-function OnPlayerJoin(playerIndex)
-    if not race then
-        CheckMapAndGametype(false)
-    end
-
-    -- Initialize player data
-    resetPlayerData(playerIndex)
-
-    player_ping[playerIndex] = tonumber(GetPlayerPing(playerIndex))
-
-    say(playerIndex, "This server runs Halo Race Leaderboard.")
-    say(playerIndex, "For more information, or to see the leaderboard, go to hrl.effakt.info")
-end
-
-function resetPlayerData(playerIndex)
-    player_warps[playerIndex] = 0
-    player_ping[playerIndex] = 0
-    player_ping_stability[playerIndex] = {}
-    player_checkpoints[playerIndex] = {
-        current = 0,
-        previous = 0,
-        started = false,
-        start_checkpoint = 0,
-        started_time = nil,
-        checkpoints = {}
-    }
-end
-
-function OnPlayerQuit(playerIndex)
-    resetPlayerData(playerIndex)
-    print(string.format("Player %d quit, reset their data", playerIndex))
-end
-
-function CheckMapAndGametype(NewGame)
-    if get_var(1, "$gt") == "race" then
-        if not NewGame and race then
-            return false
-        end
-        
-        current_map = get_var(1, "$map")
-        race = true
-        register_callback(cb['EVENT_SCORE'], "OnPlayerScore")
-
-        safe_read(true)
-        local offset = (halo_type == "PC") and GAMETYPE_MODE_OFFSET_PC or GAMETYPE_MODE_OFFSET_CE
-        mode = read_byte(gametype_base + offset)
-        safe_read(false)
-    else
-        race = false
-        unregister_callback(cb['EVENT_SCORE'])
-    end
-end
-
-function OnGameStart()
-    CheckMapAndGametype(true)
-
-    for i = 1, MAX_PLAYERS do
-        resetPlayerData(i)
-        player_ping[i] = tonumber(GetPlayerPing(i))
-    end
-end
-
-function OnGameEnd()
-    for i = 1, MAX_PLAYERS do
-        resetPlayerData(i)
-    end
-    if not race or mode == 2 then
-        return false
-    end
-end
-
-function OnScriptUnload()
-    execute_command("query_del hrl_enabled")
-    execute_command("query_del hrl_protocol")
-    execute_command("query_del hrl_token")
-    execute_command("query_del hrl_token_prev")
-end
-
-function OnTick()
-    local now = get_time()
-    if not allow_warps then
-        CheckPings()
-    end
-
-    if next(active_requests) ~= nil then
-        pollHttpResponses()
-    end
-
-    -- Periodic token rotation, not tied to any game event. Compared against os.time() (wall clock), matching what RotateHrlToken() now stores
-    if os.time() - hrl_token_last_rotated >= HRL_TOKEN_ROTATE_INTERVAL_SECONDS then
-        RotateHrlToken()
-    end
-
-    TrackCheckpoints(now)
-end
-
-function pollHttpResponses()
-    local now = get_time()
-    local responses_processed = 0
-    
-    -- Check for timed out requests first
-    for player_idx, request_info in pairs(active_requests) do
-        if now - request_info.start_time > (REQUEST_TIMEOUT_TICKS / 30) then
-            print(string.format("%s request for player %d timed out after %.1f seconds", 
-                  request_info.request_type, player_idx, (REQUEST_TIMEOUT_TICKS / 30)))
-            active_requests[player_idx] = nil
-        end
-    end
-    
-    -- Process any available responses
-    while true do
-        local player_index, response_body = poll_http()
-        if not player_index then break end
-        
-        responses_processed = responses_processed + 1
-        
-        -- Get request info before removing
-        local request_info = active_requests[player_index]
-        active_requests[player_index] = nil
-        
-        if not request_info then
-            print(string.format("Received response for player %d but no active request found", player_index))
-            print("Response body: " .. response_body)
-            goto continue
-        end
-
-        print(response_body)
-        
-        -- Parse the JSON response using json:decode()
-        local success, response = pcall(function()
-            return json:decode(response_body)
-        end)
-        
-        if not success then
-            print(string.format("Failed to parse %s response for player %d: %s", 
-                  request_info.request_type, player_index, response_body))
-            say(player_index, "Error processing server response")
-            goto continue
-        end
-        
-        -- Handle based on request type
-        if request_info.request_type == "newtime" then
-           -- Normalize response shapes: accept [obj], { data = obj } or direct obj
-            local resp = response
-            if type(resp) == "table" and #resp > 0 and resp[1] then
-                resp = resp[1]
-            end
-            local payload = resp
-            if type(resp) == "table" and resp.data then
-                payload = resp.data
-            end
-
-            local ok = (type(resp) == "table" and resp.success) or (type(payload) == "table" and payload.success)
-
-            if ok then
-                local message = (type(resp) == "table" and resp.message) or (type(payload) == "table" and payload.message)
-                if message then
-                    say(player_index, message)
-                else
-                    say(player_index, "Time recorded successfully!")
-                end
-
-                -- leaderboardPosition may be nested in payload
-                local lb = (type(payload) == "table" and payload.leaderboardPosition) or resp.position or payload.position
-                if type(lb) == "table" and lb.position then
-                    if lb.position == 1 then
-                        local player_name = string.toutf8(get_var(player_index, "$name"))
-                        local time_val = lb.top_time or "?"
-                        say_all(player_name .. " set a new lap record: " .. time_val .. " seconds!")
-                        -- say(player_index, "New lap time record set!")
-                    else
-                        local diff_str = tostring(lb.difference or "?")
-                        say(player_index, string.format("Leaderboard position: #%d (%.2f sec behind #1)", lb.position, tonumber(lb.difference) or 0))
-                    end
-                elseif type(lb) == "number" then
-                    say(player_index, "Leaderboard position: #" .. lb)
-                end
-            else
-                local error_msg = (type(resp) == "table" and (resp.error or resp.message)) or (type(payload) == "table" and (payload.error or payload.message)) or "Unknown error"
-                say(player_index, "Failed to record time: " .. error_msg)
-            end
-            
-        elseif request_info.request_type == "claimplayer" then
-            if response.success then
-                say(player_index, response.message or "Player claimed successfully! You can now view your stats online.")
-            else
-                local error_msg = response.error or response.message or "Unknown error"
-                say(player_index, "Claim failed: " .. error_msg)
-            end
-        end
-        
-        ::continue::
-    end
-    
-    -- Log if we processed any responses
-    if responses_processed > 0 then
-        local active_count = 0
-        for _ in pairs(active_requests) do active_count = active_count + 1 end
-        print(string.format("Processed %d responses, %d requests still pending", 
-              responses_processed, active_count))
-    end
-end
-
-
-
--- Normalize checkpoint IDs from game format (0,1,3,7,15,31,...) to sequential (0,1,2,3,4,5,...)
-local function NormalizeCheckpointId(raw_id)
-    if raw_id == 0 then return 0 end
-    -- Game uses pattern: 2^n - 1, so normalize by: log2(raw_id + 1)
-    local normalized = 0
-    local temp = raw_id + 1
-    while temp > 1 do
-        temp = math.floor(temp / 2)
-        normalized = normalized + 1
-    end
-    return normalized
-end
-
-local function GetCurrentCheckpoint(playerIndex)
-    if not player_present(playerIndex) then return 0 end
-    if race_globals == 0 then
-        safe_read(false)
-        --print("DEBUG: race_globals is 0 for player " .. playerIndex)
-        return 0
-    end
-
-    local checkpoint_address = race_globals + to_real_index(playerIndex) * 4 + 0x44
-    local checkpoint_id = read_dword(checkpoint_address)
-
-    -- print(string.format("DEBUG: Player %d checkpoint address: 0x%X, id: %d", playerIndex, checkpoint_address, checkpoint_id))
-    
-    local cp = tonumber(checkpoint_id) or 0
-    if cp > 0 then
-        -- print(string.format("DEBUG: Player %d checkpoint: %d", playerIndex, cp))
-    end
-    -- Normalize checkpoint ID to sequential numbering
-    return NormalizeCheckpointId(cp)
-end
-
-function TrackCheckpoints(now)
-    local player_present_loc = player_present
-    local get_cp = GetCurrentCheckpoint
-    local pcs = player_checkpoints
-    local say_loc = say
-    local fmt = string.format
-
-    for i = 1, MAX_PLAYERS do
-        if player_present_loc(i) then
-            local current_cp = get_cp(i)
-            local checkpoint = pcs[i]
-
-            checkpoint.previous = checkpoint.current
-            checkpoint.current = current_cp
-
-            -- Reset if at checkpoint 0 (not on track) - finish lap
-            if current_cp == 0 and checkpoint.started then
-                -- finalize previous checkpoint's end_time if missing
-                local last_cp = checkpoint.checkpoints[#checkpoint.checkpoints]
-                if last_cp and last_cp.end_time == nil then
-                    last_cp.end_time = now
-                    local split_duration = last_cp.end_time - last_cp.start
-                    if last_cp.checkpoint_id ~= 0 then
-                        say_loc(i, fmt("CP %d->0 - Split: %.2f sec", last_cp.checkpoint_id, split_duration))
-                    end
-                end
-                checkpoint.started = false
-                checkpoint.start_checkpoint = 0
-            end
-
-            -- Start lap on first checkpoint
-            if current_cp >= 1 and not checkpoint.started then
-                checkpoint.started = true
-                checkpoint.start_checkpoint = current_cp
-                checkpoint.started_time = now
-                checkpoint.checkpoints = {
-                    {
-                        checkpoint_id = 0,
-                        start = now,
-                        end_time = nil
-                    }
-                }
-            end
-
-            -- Record split time if checkpoint advanced
-            if checkpoint.started and current_cp > 0 and current_cp ~= checkpoint.previous then
-                -- Update previous checkpoint's end_time
-                local last_cp_data = checkpoint.checkpoints[#checkpoint.checkpoints]
-                if last_cp_data then
-                    last_cp_data.end_time = now
-                    local split_duration = now - last_cp_data.start
-                    -- Display split to player (skip logging 0->1 transitions)
-                    if last_cp_data.checkpoint_id ~= 0 then
-                        say(i, fmt("CP %d->%d - Split: %.2f sec", last_cp_data.checkpoint_id, current_cp, split_duration))
-                    end
-                end
-
-                -- Add new checkpoint
-                table.insert(checkpoint.checkpoints, {
-                    checkpoint_id = current_cp,
-                    start = now,
-                    end_time = nil
-                })
-            end
-        end
-    end
-end
-
-function CheckPings()
-    local current_ticks = get_var(1, "$ticks")
-    
-    if (current_ticks - last_ping_check) < PING_CHECK_INTERVAL then
-        return
-    end
-
-    for i = 1, MAX_PLAYERS do
-        if player_present(i) then
-            local ping = tonumber(GetPlayerPing(i))
-            local prev_ping = player_ping[i]
-
-            if prev_ping and prev_ping > 0 and (ping - prev_ping) > ping_threshold then
-                player_warps[i] = 1
-                say(i, "We just detected a ping spike. This lap will not count")
-            end
-
-            player_ping[i] = ping
-        end
-    end
-
-    last_ping_check = current_ticks
-end
-
-function GetPlayerPing(PlayerIndex)
-    if (player_present(PlayerIndex)) then
-        return get_var(PlayerIndex, "$ping")
-    else
-        return 0
-    end
-end
+local Encoding = {}
 
 local char, byte, pairs, floor = string.char, string.byte, pairs, math.floor
 local table_insert, table_concat = table.insert, table.concat
 local unpack = table.unpack or unpack
 
 local function unicode_to_utf8(code)
-    -- converts numeric UTF code (U+code) to UTF-8 string
     local t, h = {}, 128
     while code >= h do
         t[#t + 1] = 128 + code % 64
@@ -735,7 +97,6 @@ local function unicode_to_utf8(code)
 end
 
 local function utf8_to_unicode(utf8str, pos)
-    -- pos = starting byte position inside input string (default 1)
     pos = pos or 1
     local code, size = utf8str:byte(pos), 1
     if code >= 0xC0 and code < 0xFE then
@@ -751,146 +112,50 @@ local function utf8_to_unicode(utf8str, pos)
             mask = mask * 32
         until code < mask
     end
-    -- returns code, number of bytes in this utf8 char
     return code, size
 end
 
 local map_1252_to_unicode = {
-    [0x80] = 0x20AC,
-    [0x81] = 0x81,
-    [0x82] = 0x201A,
-    [0x83] = 0x0192,
-    [0x84] = 0x201E,
-    [0x85] = 0x2026,
-    [0x86] = 0x2020,
-    [0x87] = 0x2021,
-    [0x88] = 0x02C6,
-    [0x89] = 0x2030,
-    [0x8A] = 0x0160,
-    [0x8B] = 0x2039,
-    [0x8C] = 0x0152,
-    [0x8D] = 0x8D,
-    [0x8E] = 0x017D,
-    [0x8F] = 0x8F,
-    [0x90] = 0x90,
-    [0x91] = 0x2018,
-    [0x92] = 0x2019,
-    [0x93] = 0x201C,
-    [0x94] = 0x201D,
-    [0x95] = 0x2022,
-    [0x96] = 0x2013,
-    [0x97] = 0x2014,
-    [0x98] = 0x02DC,
-    [0x99] = 0x2122,
-    [0x9A] = 0x0161,
-    [0x9B] = 0x203A,
-    [0x9C] = 0x0153,
-    [0x9D] = 0x9D,
-    [0x9E] = 0x017E,
-    [0x9F] = 0x0178,
-    [0xA0] = 0x00A0,
-    [0xA1] = 0x00A1,
-    [0xA2] = 0x00A2,
-    [0xA3] = 0x00A3,
-    [0xA4] = 0x00A4,
-    [0xA5] = 0x00A5,
-    [0xA6] = 0x00A6,
-    [0xA7] = 0x00A7,
-    [0xA8] = 0x00A8,
-    [0xA9] = 0x00A9,
-    [0xAA] = 0x00AA,
-    [0xAB] = 0x00AB,
-    [0xAC] = 0x00AC,
-    [0xAD] = 0x00AD,
-    [0xAE] = 0x00AE,
-    [0xAF] = 0x00AF,
-    [0xB0] = 0x00B0,
-    [0xB1] = 0x00B1,
-    [0xB2] = 0x00B2,
-    [0xB3] = 0x00B3,
-    [0xB4] = 0x00B4,
-    [0xB5] = 0x00B5,
-    [0xB6] = 0x00B6,
-    [0xB7] = 0x00B7,
-    [0xB8] = 0x00B8,
-    [0xB9] = 0x00B9,
-    [0xBA] = 0x00BA,
-    [0xBB] = 0x00BB,
-    [0xBC] = 0x00BC,
-    [0xBD] = 0x00BD,
-    [0xBE] = 0x00BE,
-    [0xBF] = 0x00BF,
-    [0xC0] = 0x00C0,
-    [0xC1] = 0x00C1,
-    [0xC2] = 0x00C2,
-    [0xC3] = 0x00C3,
-    [0xC4] = 0x00C4,
-    [0xC5] = 0x00C5,
-    [0xC6] = 0x00C6,
-    [0xC7] = 0x00C7,
-    [0xC8] = 0x00C8,
-    [0xC9] = 0x00C9,
-    [0xCA] = 0x00CA,
-    [0xCB] = 0x00CB,
-    [0xCC] = 0x00CC,
-    [0xCD] = 0x00CD,
-    [0xCE] = 0x00CE,
-    [0xCF] = 0x00CF,
-    [0xD0] = 0x00D0,
-    [0xD1] = 0x00D1,
-    [0xD2] = 0x00D2,
-    [0xD3] = 0x00D3,
-    [0xD4] = 0x00D4,
-    [0xD5] = 0x00D5,
-    [0xD6] = 0x00D6,
-    [0xD7] = 0x00D7,
-    [0xD8] = 0x00D8,
-    [0xD9] = 0x00D9,
-    [0xDA] = 0x00DA,
-    [0xDB] = 0x00DB,
-    [0xDC] = 0x00DC,
-    [0xDD] = 0x00DD,
-    [0xDE] = 0x00DE,
-    [0xDF] = 0x00DF,
-    [0xE0] = 0x00E0,
-    [0xE1] = 0x00E1,
-    [0xE2] = 0x00E2,
-    [0xE3] = 0x00E3,
-    [0xE4] = 0x00E4,
-    [0xE5] = 0x00E5,
-    [0xE6] = 0x00E6,
-    [0xE7] = 0x00E7,
-    [0xE8] = 0x00E8,
-    [0xE9] = 0x00E9,
-    [0xEA] = 0x00EA,
-    [0xEB] = 0x00EB,
-    [0xEC] = 0x00EC,
-    [0xED] = 0x00ED,
-    [0xEE] = 0x00EE,
-    [0xEF] = 0x00EF,
-    [0xF0] = 0x00F0,
-    [0xF1] = 0x00F1,
-    [0xF2] = 0x00F2,
-    [0xF3] = 0x00F3,
-    [0xF4] = 0x00F4,
-    [0xF5] = 0x00F5,
-    [0xF6] = 0x00F6,
-    [0xF7] = 0x00F7,
-    [0xF8] = 0x00F8,
-    [0xF9] = 0x00F9,
-    [0xFA] = 0x00FA,
-    [0xFB] = 0x00FB,
-    [0xFC] = 0x00FC,
-    [0xFD] = 0x00FD,
-    [0xFE] = 0x00FE,
-    [0xFF] = 0x00FF
+    [0x80] = 0x20AC, [0x81] = 0x81,   [0x82] = 0x201A, [0x83] = 0x0192,
+    [0x84] = 0x201E, [0x85] = 0x2026, [0x86] = 0x2020, [0x87] = 0x2021,
+    [0x88] = 0x02C6, [0x89] = 0x2030, [0x8A] = 0x0160, [0x8B] = 0x2039,
+    [0x8C] = 0x0152, [0x8D] = 0x8D,   [0x8E] = 0x017D, [0x8F] = 0x8F,
+    [0x90] = 0x90,   [0x91] = 0x2018, [0x92] = 0x2019, [0x93] = 0x201C,
+    [0x94] = 0x201D, [0x95] = 0x2022, [0x96] = 0x2013, [0x97] = 0x2014,
+    [0x98] = 0x02DC, [0x99] = 0x2122, [0x9A] = 0x0161, [0x9B] = 0x203A,
+    [0x9C] = 0x0153, [0x9D] = 0x9D,   [0x9E] = 0x017E, [0x9F] = 0x0178,
+    [0xA0] = 0x00A0, [0xA1] = 0x00A1, [0xA2] = 0x00A2, [0xA3] = 0x00A3,
+    [0xA4] = 0x00A4, [0xA5] = 0x00A5, [0xA6] = 0x00A6, [0xA7] = 0x00A7,
+    [0xA8] = 0x00A8, [0xA9] = 0x00A9, [0xAA] = 0x00AA, [0xAB] = 0x00AB,
+    [0xAC] = 0x00AC, [0xAD] = 0x00AD, [0xAE] = 0x00AE, [0xAF] = 0x00AF,
+    [0xB0] = 0x00B0, [0xB1] = 0x00B1, [0xB2] = 0x00B2, [0xB3] = 0x00B3,
+    [0xB4] = 0x00B4, [0xB5] = 0x00B5, [0xB6] = 0x00B6, [0xB7] = 0x00B7,
+    [0xB8] = 0x00B8, [0xB9] = 0x00B9, [0xBA] = 0x00BA, [0xBB] = 0x00BB,
+    [0xBC] = 0x00BC, [0xBD] = 0x00BD, [0xBE] = 0x00BE, [0xBF] = 0x00BF,
+    [0xC0] = 0x00C0, [0xC1] = 0x00C1, [0xC2] = 0x00C2, [0xC3] = 0x00C3,
+    [0xC4] = 0x00C4, [0xC5] = 0x00C5, [0xC6] = 0x00C6, [0xC7] = 0x00C7,
+    [0xC8] = 0x00C8, [0xC9] = 0x00C9, [0xCA] = 0x00CA, [0xCB] = 0x00CB,
+    [0xCC] = 0x00CC, [0xCD] = 0x00CD, [0xCE] = 0x00CE, [0xCF] = 0x00CF,
+    [0xD0] = 0x00D0, [0xD1] = 0x00D1, [0xD2] = 0x00D2, [0xD3] = 0x00D3,
+    [0xD4] = 0x00D4, [0xD5] = 0x00D5, [0xD6] = 0x00D6, [0xD7] = 0x00D7,
+    [0xD8] = 0x00D8, [0xD9] = 0x00D9, [0xDA] = 0x00DA, [0xDB] = 0x00DB,
+    [0xDC] = 0x00DC, [0xDD] = 0x00DD, [0xDE] = 0x00DE, [0xDF] = 0x00DF,
+    [0xE0] = 0x00E0, [0xE1] = 0x00E1, [0xE2] = 0x00E2, [0xE3] = 0x00E3,
+    [0xE4] = 0x00E4, [0xE5] = 0x00E5, [0xE6] = 0x00E6, [0xE7] = 0x00E7,
+    [0xE8] = 0x00E8, [0xE9] = 0x00E9, [0xEA] = 0x00EA, [0xEB] = 0x00EB,
+    [0xEC] = 0x00EC, [0xED] = 0x00ED, [0xEE] = 0x00EE, [0xEF] = 0x00EF,
+    [0xF0] = 0x00F0, [0xF1] = 0x00F1, [0xF2] = 0x00F2, [0xF3] = 0x00F3,
+    [0xF4] = 0x00F4, [0xF5] = 0x00F5, [0xF6] = 0x00F6, [0xF7] = 0x00F7,
+    [0xF8] = 0x00F8, [0xF9] = 0x00F9, [0xFA] = 0x00FA, [0xFB] = 0x00FB,
+    [0xFC] = 0x00FC, [0xFD] = 0x00FD, [0xFE] = 0x00FE, [0xFF] = 0x00FF
 }
+
 local map_unicode_to_1252 = {}
 for code1252, code in pairs(map_1252_to_unicode) do
     map_unicode_to_1252[code] = code1252
 end
 
-function string.fromutf8(utf8str)
+function Encoding.fromutf8(utf8str)
     local pos, result_1252 = 1, {}
     while pos <= #utf8str do
         local code, size = utf8_to_unicode(utf8str, pos)
@@ -901,11 +166,900 @@ function string.fromutf8(utf8str)
     return table_concat(result_1252)
 end
 
-function string.toutf8(str1252)
+function Encoding.toutf8(str1252)
     local result_utf8 = {}
     for pos = 1, #str1252 do
         local code = str1252:byte(pos)
         table_insert(result_utf8, unicode_to_utf8(map_1252_to_unicode[code] or code))
     end
     return table_concat(result_utf8)
+end
+
+-- =============================================================================
+-- HrlToken Module: Query field publishing and rotation
+-- =============================================================================
+
+local HrlToken = {}
+HrlToken.__index = HrlToken
+
+function HrlToken:new()
+    local obj = {
+        token = nil,
+        token_prev = nil,
+        last_rotated = 0,
+        rotate_interval = CONSTANTS.HRL_TOKEN_ROTATE_INTERVAL_SECONDS,
+        protocol = CONSTANTS.HRL_PROTOCOL,
+    }
+    setmetatable(obj, self)
+    return obj
+end
+
+function HrlToken:random_hex(length)
+    local chars = "0123456789abcdef"
+    local out = {}
+    for i = 1, length do
+        local idx = math.random(1, #chars)
+        out[i] = chars:sub(idx, idx)
+    end
+    return table.concat(out)
+end
+
+function HrlToken:publish()
+    execute_command("query_add hrl_enabled 1")
+    execute_command("query_add hrl_protocol " .. self.protocol)
+    execute_command("query_add hrl_token " .. (self.token or ""))
+    execute_command("query_add hrl_token_prev " .. (self.token_prev or ""))
+end
+
+function HrlToken:rotate()
+    self.token_prev = self.token
+    self.token = self:random_hex(32)
+    self.last_rotated = os.time()
+    self:publish()
+end
+
+function HrlToken:cleanup()
+    execute_command("query_del hrl_enabled")
+    execute_command("query_del hrl_protocol")
+    execute_command("query_del hrl_token")
+    execute_command("query_del hrl_token_prev")
+end
+
+function HrlToken:should_rotate()
+    return os.time() - self.last_rotated >= self.rotate_interval
+end
+
+-- =============================================================================
+-- ApiClient Module: HTTP requests, polling, timeouts
+-- =============================================================================
+
+local ApiClient = {}
+ApiClient.__index = ApiClient
+
+function ApiClient:new()
+    local obj = {
+        active_requests = {},  -- request_id -> { player_index, start_wall_time, request_type }
+        next_request_id = 1,
+    }
+    setmetatable(obj, self)
+    return obj
+end
+
+function ApiClient:generate_request_id()
+    local id = self.next_request_id
+    self.next_request_id = self.next_request_id + 1
+    return id
+end
+
+function ApiClient:generate_submission_id(playerIndex)
+    return string.format("%d-%d-%d", math.floor(get_time() * 1000), playerIndex, math.random(100000, 999999999))
+end
+
+function ApiClient:post(url, body, player_index, request_type)
+    local req_id = self:generate_request_id()
+    self.active_requests[req_id] = {
+        player_index = player_index,
+        start_wall_time = os.time(),
+        request_type = request_type,
+    }
+    http_client.http_post(req_id, url, body)
+    return req_id
+end
+
+function ApiClient:poll()
+    local id_buf = ffi.new("uint32_t[1]")
+    local ptr = http_client.http_poll(id_buf)
+    if ptr ~= nil then
+        local body = ffi.string(ptr)
+        http_client.http_free(ptr)
+        return id_buf[0], body
+    end
+    return nil, nil
+end
+
+function ApiClient:process_responses(json_decoder, say_fn, say_all_fn, get_var_fn)
+    local now = os.time()
+    local responses_processed = 0
+
+    -- Timeout check (wall-clock based, survives map transitions)
+    for req_id, req_info in pairs(self.active_requests) do
+        if now - req_info.start_wall_time > CONSTANTS.REQUEST_TIMEOUT_SECONDS then
+            print(string.format("%s request for player %d timed out after %d seconds",
+                  req_info.request_type, req_info.player_index, CONSTANTS.REQUEST_TIMEOUT_SECONDS))
+            self.active_requests[req_id] = nil
+        end
+    end
+
+    -- Process available responses
+    while true do
+        local req_id, response_body = self:poll()
+        if not req_id then break end
+
+        responses_processed = responses_processed + 1
+
+        local req_info = self.active_requests[req_id]
+        self.active_requests[req_id] = nil
+
+        if not req_info then
+            print(string.format("Received response for req_id %d but no active request found", req_id))
+            print("Response body: " .. response_body)
+        else
+            self:handle_response(req_info, response_body, json_decoder, say_fn, say_all_fn, get_var_fn)
+        end
+    end
+
+    if responses_processed > 0 then
+        local active_count = 0
+        for _ in pairs(self.active_requests) do active_count = active_count + 1 end
+        print(string.format("Processed %d responses, %d requests still pending",
+              responses_processed, active_count))
+    end
+end
+
+function ApiClient:handle_response(req_info, response_body, json_decoder, say_fn, say_all_fn, get_var_fn)
+    print(response_body)
+
+    local success, response = pcall(function()
+        return json_decoder:decode(response_body)
+    end)
+
+    if not success then
+        print(string.format("Failed to parse %s response for player %d: %s",
+              req_info.request_type, req_info.player_index, response_body))
+        say_fn(req_info.player_index, "Error processing server response")
+        return
+    end
+
+    if req_info.request_type == "newtime" then
+        self:handle_newtime_response(req_info.player_index, response, say_fn, say_all_fn, get_var_fn)
+    elseif req_info.request_type == "claimplayer" then
+        self:handle_claim_response(req_info.player_index, response, say_fn)
+    end
+end
+
+function ApiClient:handle_newtime_response(player_index, response, say_fn, say_all_fn, get_var_fn)
+    -- Normalize response shapes: accept [obj], { data = obj } or direct obj
+    local resp = response
+    if type(resp) == "table" and #resp > 0 and resp[1] then
+        resp = resp[1]
+    end
+    local payload = resp
+    if type(resp) == "table" and resp.data then
+        payload = resp.data
+    end
+
+    local ok = (type(resp) == "table" and resp.success) or (type(payload) == "table" and payload.success)
+
+    if ok then
+        local message = (type(resp) == "table" and resp.message) or (type(payload) == "table" and payload.message)
+        if message then
+            say_fn(player_index, message)
+        else
+            say_fn(player_index, "Time recorded successfully!")
+        end
+
+        local is_new_record = (type(resp) == "table" and resp.isNewRecord) or (type(payload) == "table" and payload.isNewRecord)
+        local lap_time = (type(resp) == "table" and resp.lapTime) or (type(payload) == "table" and payload.lapTime)
+
+        local lb = (type(payload) == "table" and payload.leaderboardPosition) or resp.position or payload.position
+        if type(lb) == "table" and lb.position then
+            if lb.position == 1 and is_new_record then
+                local player_name = Encoding.toutf8(get_var_fn(player_index, "$name"))
+                local time_val = lap_time or lb.top_time or "?"
+                say_all_fn(player_name .. " set a new lap record: " .. time_val .. " seconds!")
+            elseif lb.position == 1 then
+                -- Already the record holder; this lap just didn't beat your own best.
+                say_fn(player_index, "Leaderboard position: #1 (your record stands at " .. (lb.top_time or "?") .. " seconds)")
+            else
+                local diff_str = tostring(lb.difference or "?")
+                say_fn(player_index, string.format("Leaderboard position: #%d (%.2f sec behind #1)",
+                        lb.position, tonumber(lb.difference) or 0))
+            end
+        elseif type(lb) == "number" then
+            say_fn(player_index, "Leaderboard position: #" .. lb)
+        end
+    else
+        local error_msg = (type(resp) == "table" and (resp.error or resp.message)) or
+                          (type(payload) == "table" and (payload.error or payload.message)) or "Unknown error"
+        say_fn(player_index, "Failed to record time: " .. error_msg)
+    end
+end
+
+function ApiClient:handle_claim_response(player_index, response, say_fn)
+    if response.success then
+        say_fn(player_index, response.message or "Player claimed successfully! You can now view your stats online.")
+    else
+        local error_msg = response.error or response.message or "Unknown error"
+        say_fn(player_index, "Claim failed: " .. error_msg)
+    end
+end
+
+-- =============================================================================
+-- PlayerState Module: Per-player lap, warp, ping tracking
+-- =============================================================================
+
+local PlayerState = {}
+PlayerState.__index = PlayerState
+
+function PlayerState:new(playerIndex)
+    local obj = {
+        index = playerIndex,
+        warps = 0,
+        ping = 0,
+        ping_stability = {},
+        -- Checkpoint/lap state
+        current_cp = 0,
+        previous_cp = 0,
+        started = false,
+        start_checkpoint = 0,
+        started_time = nil,
+        checkpoints = {},
+        seen_checkpoints = {},  -- For AnyOrder: track which checkpoint IDs have been visited
+        lap_submitted = false,  -- Idempotency guard against duplicate submissions
+        lap_completed = false, -- TRUE only when player actually finished the lap (score/Rally CP0)
+    }
+    setmetatable(obj, self)
+    return obj
+end
+
+function PlayerState:reset()
+    self.warps = 0
+    self.ping = 0
+    self.ping_stability = {}
+    self.current_cp = 0
+    self.previous_cp = 0
+    self.started = false
+    self.start_checkpoint = 0
+    self.started_time = nil
+    self.checkpoints = {}
+    self.seen_checkpoints = {}
+    self.lap_submitted = false
+    self.lap_completed = false
+end
+
+function PlayerState:has_valid_lap()
+    return self.started and self.started_time ~= nil and not self.lap_submitted
+end
+
+function PlayerState:mark_submitted()
+    self.lap_submitted = true
+end
+
+function PlayerState:is_warped()
+    return self.warps > 0
+end
+
+-- =============================================================================
+-- LapTracker Module: Checkpoint reading, bitset decoding, split recording, lap finish
+-- =============================================================================
+
+local LapTracker = {}
+LapTracker.__index = LapTracker
+
+function LapTracker:new(race_globals_addr, api_client, hrl_token)
+    local obj = {
+        race_globals = race_globals_addr,
+        api_client = api_client,
+        hrl_token = hrl_token,
+        players = {},
+        allow_warps = false,
+        current_map = nil,
+        race_type = 0,  -- 0=normal, 1=AnyOrder, 2=Rally
+        game_started = false,
+    }
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        obj.players[i] = PlayerState:new(i)
+    end
+    setmetatable(obj, self)
+    return obj
+end
+
+function LapTracker:set_map(map_name)
+    self.current_map = map_name
+end
+
+function LapTracker:set_race_type(race_type)
+    self.race_type = race_type
+end
+
+function LapTracker:set_game_started(started)
+    self.game_started = started
+end
+
+function LapTracker:reset_all()
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        self.players[i]:reset()
+    end
+end
+
+function LapTracker:reset_player(playerIndex)
+    if self.players[playerIndex] then
+        self.players[playerIndex]:reset()
+    end
+end
+
+-- Decode raw checkpoint bits into individual checkpoint IDs
+-- Game uses bitset pattern: bit N set = checkpoint N+1 visited
+-- raw_id values: 0=none, 1=cp1, 3=cp1+cp2, 7=cp1+cp2+cp3, etc.
+function LapTracker:decode_checkpoint_bits(raw_id)
+    local checkpoints = {}
+    if raw_id == 0 then
+        return checkpoints
+    end
+    local temp = raw_id
+    local bit_index = 0
+    while temp > 0 do
+        if temp % 2 == 1 then
+            table.insert(checkpoints, bit_index + 1)
+        end
+        temp = math.floor(temp / 2)
+        bit_index = bit_index + 1
+    end
+    return checkpoints
+end
+
+-- Legacy normalize for reference (not used in bitset tracking)
+function LapTracker:normalize_checkpoint_id(raw_id)
+    if raw_id == 0 then return 0 end
+    local normalized = 0
+    local temp = raw_id + 1
+    while temp > 1 do
+        temp = math.floor(temp / 2)
+        normalized = normalized + 1
+    end
+    return normalized
+end
+
+function LapTracker:get_raw_checkpoint(playerIndex)
+    if not player_present(playerIndex) then return 0 end
+    if self.race_globals == 0 then
+        safe_read(false)
+        return 0
+    end
+    local checkpoint_address = self.race_globals + to_real_index(playerIndex) * 4 + CONSTANTS.RACE_GLOBALS_OFFSET
+    local checkpoint_id = read_dword(checkpoint_address)
+    return tonumber(checkpoint_id) or 0
+end
+
+function LapTracker:record_split(playerIndex, cp_id, now)
+    local player = self.players[playerIndex]
+
+    -- Finalize previous checkpoint
+    local last_cp = player.checkpoints[#player.checkpoints]
+    if last_cp and last_cp.end_time == nil then
+        last_cp.end_time = now
+        if last_cp.checkpoint_id ~= 0 then
+            local split_duration = last_cp.end_time - last_cp.start
+            say(playerIndex, string.format("CP %d->%d - Split: %.2f sec", last_cp.checkpoint_id, cp_id, split_duration))
+        end
+    end
+
+    -- Add new checkpoint entry
+    table.insert(player.checkpoints, {
+        checkpoint_id = cp_id,
+        start = now,
+        end_time = nil,
+    })
+end
+
+-- Core idempotent lap finalization
+-- Called from OnPlayerScore (normal finish), TrackCheckpoints (Rally CP0), or OnGameEnd (cleanup)
+function LapTracker:finish_lap(playerIndex, reason, now)
+    local player = self.players[playerIndex]
+
+    -- Guard: must have started, not already submitted
+    if not player:has_valid_lap() then
+        return false
+    end
+
+    -- Guard: warped laps are finalized but not submitted
+    if player:is_warped() then
+        say(playerIndex, "We detected a warp or a lag spike, your lap time was not recorded")
+        player:mark_submitted()  -- Mark as handled so we don't retry
+        player:reset()
+        return false
+    end
+
+    -- Finalize any open split
+    local last_cp = player.checkpoints[#player.checkpoints]
+    if last_cp and last_cp.end_time == nil then
+        last_cp.end_time = now
+        if last_cp.checkpoint_id ~= 0 then
+            local split_duration = last_cp.end_time - last_cp.start
+            say(playerIndex, string.format("CP %d->Finish - Split: %.2f sec", last_cp.checkpoint_id, split_duration))
+        end
+    end
+
+    local best_time = now - player.started_time
+
+    -- Build splits payload
+    local splits = {}
+    for _, entry in ipairs(player.checkpoints) do
+        if entry.checkpoint_id ~= 0 and entry.start and entry.end_time then
+            table.insert(splits, {
+                checkpoint_id = entry.checkpoint_id,
+                startTime = entry.start,
+                endTime = entry.end_time,
+                duration = entry.end_time - entry.start,
+            })
+        end
+    end
+
+    -- Submit via API
+    self:submit_lap(playerIndex, best_time, splits)
+
+    player:mark_submitted()
+
+    if reason == "score" then
+        say(playerIndex, "Your time of " .. best_time .. " has been recorded.")
+    elseif reason == "rally" then
+        say(playerIndex, "Rally lap completed: " .. best_time .. " seconds.")
+    elseif reason == "game_end" then
+        say(playerIndex, "Final lap submitted: " .. best_time .. " seconds.")
+    end
+
+    return true
+end
+
+function LapTracker:submit_lap(playerIndex, best_time, splits)
+    local player_hash = get_var(playerIndex, "$hash")
+    local current_name = Encoding.toutf8(get_var(playerIndex, "$name"))
+    local is_debug = debug == 1
+
+    local data = {
+        port = server_port,
+        player_hash = player_hash,
+        player_name = current_name,
+        map_name = self.current_map,
+        map_label = "",
+        race_type = self.race_type,
+        player_time = best_time,
+        hrl_token = self.hrl_token.token,
+        submission_id = self.api_client:generate_submission_id(playerIndex),
+    }
+
+    if splits and #splits > 0 then
+        data.splits = splits
+    end
+
+    if is_debug then
+        data.test = "true"
+    end
+
+    local json_str = json:encode(data)
+    print(json_str)
+
+    local api_env = is_debug and "dev" or "prod"
+    self.api_client:post(API_URLS[api_env].newtime, json_str, playerIndex, "newtime")
+end
+
+function LapTracker:track_checkpoints(now)
+    if not self.game_started then
+        return
+    end
+
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        if player_present(i) then
+            local raw_cp = self:get_raw_checkpoint(i)
+            local player = self.players[i]
+
+            player.previous_cp = player.current_cp
+            player.current_cp = raw_cp
+
+            -- Decode all checkpoint bits from raw value
+            local checkpoint_bits = self:decode_checkpoint_bits(raw_cp)
+
+            -- Rally mode: return to checkpoint 0 means lap complete
+            if raw_cp == 0 and player.started then
+                player.lap_completed = true
+                self:finish_lap(i, "rally", now)
+                player:reset()
+            end
+
+            -- Start lap on first checkpoint (any mode)
+            if raw_cp >= 1 and not player.started then
+                player.started = true
+                player.start_checkpoint = checkpoint_bits[1] or 1
+                player.started_time = now
+                player.checkpoints = {
+                    {
+                        checkpoint_id = 0,
+                        start = now,
+                        end_time = nil,
+                    }
+                }
+                player.seen_checkpoints = {}
+                player.lap_submitted = false
+            end
+
+            -- Track newly seen checkpoints
+            if player.started then
+                for _, cp_id in ipairs(checkpoint_bits) do
+                    if not player.seen_checkpoints[cp_id] then
+                        player.seen_checkpoints[cp_id] = true
+                        self:record_split(i, cp_id, now)
+                    end
+                end
+            end
+        end
+    end
+end
+
+function LapTracker:check_vehicle_driver(playerIndex)
+    local player_address = get_dynamic_player(playerIndex)
+    if not player_address then
+        return false
+    end
+
+    local vehicle_objectid = read_dword(player_address + CONSTANTS.PLAYER_VEHICLE_OFFSET)
+
+    if tonumber(vehicle_objectid) ~= CONSTANTS.INVALID_OBJECT_ID then
+        local vehicle = get_object_memory(tonumber(vehicle_objectid))
+        if not vehicle then
+            return false
+        end
+        local driver = get_object_memory(read_dword(vehicle + CONSTANTS.VEHICLE_DRIVER_OFFSET))
+        return (driver == player_address)
+    end
+
+    return true  -- Not in vehicle = considered driver (on foot)
+end
+
+-- Called from OnPlayerScore - handles normal/score-based lap completion
+function LapTracker:on_player_score(playerIndex, now)
+    local player = self.players[playerIndex]
+
+    if not player:has_valid_lap() then
+        return
+    end
+
+    player.ping_stability = {}
+
+    local is_driver = self:check_vehicle_driver(playerIndex)
+
+    if is_driver then
+        player.lap_completed = true
+        self:finish_lap(playerIndex, "score", now)
+    end
+
+    -- Always reset warp flag after score event
+    player.warps = 0
+end
+
+-- Called from OnGameEnd - submit any pending laps before cleanup
+function LapTracker:on_game_end(now)
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        -- Only auto-submit if the lap was actually completed (score event or Rally CP0)
+        -- but not yet submitted. Do NOT submit incomplete laps just because game ended
+        -- (e.g. a skip vote ending the map mid-race).
+        if player_present(i) and self.players[i]:has_valid_lap() and self.players[i].lap_completed then
+            self:finish_lap(i, "game_end", now)
+        end
+        -- Deliberately NOT resetting player state here (see LAST-LAP-BUG.md): the lap that
+        -- wins the race is exactly the lap whose EVENT_SCORE is most likely still in flight
+        -- when EVENT_GAME_END fires. Resetting immediately would wipe .started/.started_time
+        -- out from under that still-pending OnPlayerScore call, silently dropping the one
+        -- lap that actually finished. Leaving state intact lets a late OnPlayerScore still
+        -- finalize and submit normally; OnGameStart's reset_all() (and OnPlayerJoin's
+        -- reset_player()) clears any leftover never-finished lap before the next race.
+    end
+end
+
+-- =============================================================================
+-- PingChecker Module: Warp detection via ping spikes
+-- =============================================================================
+
+local PingChecker = {}
+PingChecker.__index = PingChecker
+
+function PingChecker:new()
+    local obj = {
+        last_ping_check = 0,
+        player_ping = {},
+    }
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        obj.player_ping[i] = 0
+    end
+    setmetatable(obj, self)
+    return obj
+end
+
+function PingChecker:reset()
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        self.player_ping[i] = 0
+    end
+    self.last_ping_check = 0
+end
+
+function PingChecker:get_player_ping(playerIndex)
+    if player_present(playerIndex) then
+        return tonumber(get_var(playerIndex, "$ping")) or 0
+    end
+    return 0
+end
+
+function PingChecker:check(lap_tracker)
+    local current_ticks = tonumber(get_var(1, "$ticks")) or 0
+
+    if (current_ticks - self.last_ping_check) < CONSTANTS.PING_CHECK_INTERVAL then
+        return
+    end
+
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        if player_present(i) then
+            local ping = self:get_player_ping(i)
+            local prev_ping = self.player_ping[i]
+
+            if prev_ping and prev_ping > 0 and (ping - prev_ping) > CONSTANTS.PING_THRESHOLD then
+                lap_tracker.players[i].warps = 1
+                say(i, "We just detected a ping spike. This lap will not count")
+            end
+
+            self.player_ping[i] = ping
+        end
+    end
+
+    self.last_ping_check = current_ticks
+end
+
+-- =============================================================================
+-- HRLApp Module: Top-level lifecycle, config, callbacks
+-- =============================================================================
+
+local HRLApp = {}
+HRLApp.__index = HRLApp
+
+function HRLApp:new()
+    local obj = {
+        current_map = nil,
+        race = false,
+        mode = 0,
+        game_started = false,
+        allow_warps = false,
+        race_globals = 0,
+        gametype_base = (halo_type == "PC") and CONSTANTS.GAMETYPE_BASE_PC or CONSTANTS.GAMETYPE_BASE_CE,
+    }
+
+    obj.hrl_token = HrlToken:new()
+    obj.api_client = ApiClient:new()
+    obj.lap_tracker = LapTracker:new(obj.race_globals, obj.api_client, obj.hrl_token)
+    obj.ping_checker = PingChecker:new()
+
+    setmetatable(obj, self)
+    return obj
+end
+
+function HRLApp:check_map_and_gametype(is_new_game)
+    if get_var(1, "$gt") == "race" then
+        if not is_new_game and self.race then
+            return false
+        end
+
+        self.current_map = get_var(1, "$map")
+        self.race = true
+        self.game_started = true
+
+        register_callback(cb['EVENT_SCORE'], "OnPlayerScore")
+
+        safe_read(true)
+        local offset = (halo_type == "PC") and CONSTANTS.GAMETYPE_MODE_OFFSET_PC or CONSTANTS.GAMETYPE_MODE_OFFSET_CE
+        self.mode = read_byte(self.gametype_base + offset)
+        safe_read(false)
+
+        self.lap_tracker:set_map(self.current_map)
+        self.lap_tracker:set_race_type(self.mode)
+        self.lap_tracker:set_game_started(true)
+
+        -- Re-scan race globals in case they changed
+        self.race_globals = read_dword(sig_scan("BF??????00F3ABB952000000") + 0x1)
+        self.lap_tracker.race_globals = self.race_globals
+    else
+        self.race = false
+        self.game_started = false
+        unregister_callback(cb['EVENT_SCORE'])
+        self.lap_tracker:set_game_started(false)
+    end
+end
+
+function HRLApp:on_script_load()
+    register_callback(cb['EVENT_COMMAND'], "OnServerCommand")
+    register_callback(cb['EVENT_GAME_START'], "OnGameStart")
+    register_callback(cb['EVENT_GAME_END'], "OnGameEnd")
+    register_callback(cb['EVENT_JOIN'], "OnPlayerJoin")
+    register_callback(cb['EVENT_LEAVE'], "OnPlayerQuit")
+    register_callback(cb['EVENT_WARP'], "OnWarp")
+    register_callback(cb['EVENT_TICK'], "OnTick")
+
+    self:check_map_and_gametype(true)
+
+    self.ping_checker:reset()
+
+    math.randomseed(os.time())
+    self.hrl_token:rotate()
+
+    print("HRL Loaded (refactored)")
+end
+
+function HRLApp:on_script_unload()
+    self.hrl_token:cleanup()
+end
+
+function HRLApp:on_game_start()
+    self:check_map_and_gametype(true)
+    self.lap_tracker:reset_all()
+    self.ping_checker:reset()
+
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        self.ping_checker.player_ping[i] = self.ping_checker:get_player_ping(i)
+    end
+end
+
+function HRLApp:on_game_end()
+    local now = get_time()
+    -- Submit pending laps BEFORE resetting state
+    self.lap_tracker:on_game_end(now)
+
+    -- Only reset if not race or mode == 2 (per original logic)
+    if not self.race or self.mode == 2 then
+        return false
+    end
+end
+
+function HRLApp:on_player_join(playerIndex)
+    if not self.race then
+        self:check_map_and_gametype(false)
+    end
+
+    self.lap_tracker:reset_player(playerIndex)
+    self.ping_checker.player_ping[playerIndex] = self.ping_checker:get_player_ping(playerIndex)
+
+    say(playerIndex, "This server runs Halo Race Leaderboard.")
+    say(playerIndex, "For more information, or to see the leaderboard, go to hrl.effakt.info")
+end
+
+function HRLApp:on_player_quit(playerIndex)
+    self.lap_tracker:reset_player(playerIndex)
+    print(string.format("Player %d quit, reset their data", playerIndex))
+end
+
+function HRLApp:on_player_score(playerIndex)
+    if not self.race then
+        return
+    end
+    local now = get_time()
+    self.lap_tracker:on_player_score(playerIndex, now)
+end
+
+function HRLApp:on_warp(playerIndex)
+    if not self.allow_warps then
+        self.lap_tracker.players[playerIndex].warps = 1
+        say(playerIndex, "We just detected a warp. This lap will not count")
+    end
+end
+
+function HRLApp:on_tick()
+    local now = get_time()
+
+    if not self.allow_warps then
+        self.ping_checker:check(self.lap_tracker)
+    end
+
+    if self.race and self.game_started then
+        self.lap_tracker:track_checkpoints(now)
+    end
+
+    -- Process HTTP responses
+    if next(self.api_client.active_requests) ~= nil then
+        self.api_client:process_responses(json, say, say_all, get_var)
+    end
+
+    -- Periodic token rotation
+    if self.hrl_token:should_rotate() then
+        self.hrl_token:rotate()
+    end
+end
+
+function HRLApp:on_server_command(playerIndex, command)
+    local t = {}
+    local i = 1
+    for str in string.gmatch(command, "([^%s]+)") do
+        t[i] = str
+        i = i + 1
+    end
+
+    local cmd = t[1]
+
+    if cmd == "claimplayer" then
+        self:claim_player(playerIndex, t[2])
+        return false
+    elseif debug == 1 and cmd == "logtime" then
+        -- Debug command: force log time for player 1
+        self.lap_tracker:submit_lap(1, tonumber(t[2]) or 0, {})
+        return false
+    end
+end
+
+function HRLApp:claim_player(playerIndex, claim_code)
+    local player_hash = get_var(playerIndex, "$hash")
+
+    local data = {
+        player_hash = player_hash,
+        code = claim_code
+    }
+
+    if debug == 1 then
+        data.test = true
+    end
+
+    local json_str = json:encode(data)
+
+    local api_env = debug == 1 and "dev" or "prod"
+    say(playerIndex, "Your player claim request has been submitted.")
+    self.api_client:post(API_URLS[api_env].claimplayer, json_str, playerIndex, "claimplayer")
+end
+
+-- =============================================================================
+-- Global Instance & SAPP Callbacks
+-- =============================================================================
+
+local app = HRLApp:new()
+
+function OnScriptLoad()
+    app:on_script_load()
+end
+
+function OnScriptUnload()
+    app:on_script_unload()
+end
+
+function OnGameStart()
+    app:on_game_start()
+end
+
+function OnGameEnd()
+    app:on_game_end()
+end
+
+function OnPlayerJoin(playerIndex)
+    app:on_player_join(playerIndex)
+end
+
+function OnPlayerQuit(playerIndex)
+    app:on_player_quit(playerIndex)
+end
+
+function OnPlayerScore(playerIndex)
+    app:on_player_score(playerIndex)
+end
+
+function OnWarp(playerIndex)
+    app:on_warp(playerIndex)
+end
+
+function OnTick()
+    app:on_tick()
+end
+
+function OnServerCommand(playerIndex, command)
+    return app:on_server_command(playerIndex, command)
 end
