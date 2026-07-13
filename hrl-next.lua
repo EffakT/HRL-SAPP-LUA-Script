@@ -1,6 +1,6 @@
 -- Halo Race Leaderboard (HRL) - Refactored
 -- Single-file, table-based module architecture for SAPP deployment
--- Addresses: Final lap race condition, Rally lap submission, AnyOrder bitset tracking,
+-- Addresses: Final lap race condition, AnyOrder bitset tracking,
 --            HTTP request ID collision, tick-relative timeout bugs
 
 -- TODO: Find memory address for server_port to automate this step
@@ -423,7 +423,7 @@ function PlayerState:new(playerIndex)
         checkpoints = {},
         seen_checkpoints = {},  -- For AnyOrder: track which checkpoint IDs have been visited
         lap_submitted = false,  -- Idempotency guard against duplicate submissions
-        lap_completed = false, -- TRUE only when player actually finished the lap (score/Rally CP0)
+        lap_completed = false, -- TRUE only when player actually finished the lap (score)
     }
     setmetatable(obj, self)
     return obj
@@ -570,7 +570,7 @@ function LapTracker:record_split(playerIndex, cp_id, now)
 end
 
 -- Core idempotent lap finalization
--- Called from OnPlayerScore (normal finish), TrackCheckpoints (Rally CP0), or OnGameEnd (cleanup)
+-- Called from OnPlayerScore (normal finish) or OnGameEnd (cleanup)
 function LapTracker:finish_lap(playerIndex, reason, now)
     local player = self.players[playerIndex]
 
@@ -619,8 +619,6 @@ function LapTracker:finish_lap(playerIndex, reason, now)
 
     if reason == "score" then
         say(playerIndex, "Your time of " .. best_time .. " has been recorded.")
-    elseif reason == "rally" then
-        say(playerIndex, "Rally lap completed: " .. best_time .. " seconds.")
     elseif reason == "game_end" then
         say(playerIndex, "Final lap submitted: " .. best_time .. " seconds.")
     end
@@ -660,8 +658,38 @@ function LapTracker:submit_lap(playerIndex, best_time, splits)
     self.api_client:post(API_URLS[api_env].newtime, json_str, playerIndex, "newtime")
 end
 
+-- Detects whether another slot already tracking a lap (started == true, still present)
+-- shares this slot's real identity ($hash + $name). A brief disconnect/reconnect - e.g.
+-- during a custom map's download handshake - can momentarily give the same physical player
+-- two separate player indices, both independently reading checkpoints for the same real
+-- race (confirmed against real data: two slots, same hash/name, same tick, identical lap
+-- time, on New_Mombasa_Race_v2 - a non-stock map requiring a client-side download). Checked
+-- fresh every tick at the single point a slot's lap tracking begins (see track_checkpoints
+-- below), so it doesn't matter which slot's raw_cp goes nonzero first or how many ticks
+-- later the duplicate shows up - only the earliest slot to start tracking ever starts.
+function LapTracker:find_active_slot_for_identity(hash, name, exclude_index)
+    for i = 1, CONSTANTS.MAX_PLAYERS do
+        if i ~= exclude_index and player_present(i) and self.players[i].started then
+            if get_var(i, "$hash") == hash and get_var(i, "$name") == name then
+                return i
+            end
+        end
+    end
+    return nil
+end
+
 function LapTracker:track_checkpoints(now)
     if not self.game_started then
+        return
+    end
+
+    -- Rally (race_type 2) is not supported (see docs/decisions.md) - there's no CP0-completion
+    -- trigger anymore, and Rally rounds may not fire EVENT_SCORE the same way a normal race
+    -- does, so tracking would start (splits, "CP X->Y" messages) but nothing would ever finish
+    -- or submit it. Skip tracking entirely rather than half-track a race that can never
+    -- complete; player.started staying false also means on_player_score/on_game_end's
+    -- has_valid_lap() guards naturally no-op for these players too.
+    if self.race_type == 2 then
         return
     end
 
@@ -676,27 +704,37 @@ function LapTracker:track_checkpoints(now)
             -- Decode all checkpoint bits from raw value
             local checkpoint_bits = self:decode_checkpoint_bits(raw_cp)
 
-            -- Rally mode: return to checkpoint 0 means lap complete
-            if raw_cp == 0 and player.started then
-                player.lap_completed = true
-                self:finish_lap(i, "rally", now)
-                player:reset()
-            end
-
-            -- Start lap on first checkpoint (any mode)
+            -- Start lap on first checkpoint (any mode) - but never for a slot that looks like
+            -- a duplicate/ghost connection of another slot already tracking this same player.
+            -- Suppressing it HERE (rather than only at submission) means it never starts, so
+            -- it never emits ANY event for this lap either - no split messages, no
+            -- lap-finish message, no HTTP submission. Trade-off, accepted: if the slot we
+            -- kept then drops out mid-race while the suppressed slot would have gone on to
+            -- finish, that lap is lost - preferred over double-counting every event, which
+            -- was the actual reported bug.
             if raw_cp >= 1 and not player.started then
-                player.started = true
-                player.start_checkpoint = checkpoint_bits[1] or 1
-                player.started_time = now
-                player.checkpoints = {
-                    {
-                        checkpoint_id = 0,
-                        start = now,
-                        end_time = nil,
+                local hash = get_var(i, "$hash")
+                local name = get_var(i, "$name")
+                local duplicate_of = self:find_active_slot_for_identity(hash, name, i)
+
+                if duplicate_of then
+                    print(string.format(
+                        "Slot %d looks like a duplicate connection for '%s' (already tracked by slot %d) - ignoring all events for this slot's lap",
+                        i, Encoding.toutf8(name), duplicate_of))
+                else
+                    player.started = true
+                    player.start_checkpoint = checkpoint_bits[1] or 1
+                    player.started_time = now
+                    player.checkpoints = {
+                        {
+                            checkpoint_id = 0,
+                            start = now,
+                            end_time = nil,
+                        }
                     }
-                }
-                player.seen_checkpoints = {}
-                player.lap_submitted = false
+                    player.seen_checkpoints = {}
+                    player.lap_submitted = false
+                end
             end
 
             -- Track newly seen checkpoints
@@ -756,7 +794,7 @@ end
 -- Called from OnGameEnd - submit any pending laps before cleanup
 function LapTracker:on_game_end(now)
     for i = 1, CONSTANTS.MAX_PLAYERS do
-        -- Only auto-submit if the lap was actually completed (score event or Rally CP0)
+        -- Only auto-submit if the lap was actually completed (score event)
         -- but not yet submitted. Do NOT submit incomplete laps just because game ended
         -- (e.g. a skip vote ending the map mid-race).
         if player_present(i) and self.players[i]:has_valid_lap() and self.players[i].lap_completed then
