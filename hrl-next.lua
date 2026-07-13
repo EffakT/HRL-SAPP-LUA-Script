@@ -46,6 +46,15 @@ function get_time()
     return tonumber(get_var(1, "$ticks")) / 30
 end
 
+-- Matches the web UI's own time format exactly (LapTime::formatSeconds() - "%d:%05.2f" -
+-- minutes, then seconds zero-padded to 2 decimal places, e.g. 69.87 -> "1:09.87").
+function format_time(seconds)
+    seconds = tonumber(seconds) or 0
+    local minutes = math.floor(seconds / 60)
+    local remainder = seconds - (minutes * 60)
+    return string.format("%d:%05.2f", minutes, remainder)
+end
+
 
 -- =============================================================================
 -- Constants
@@ -365,25 +374,46 @@ function ApiClient:handle_newtime_response(player_index, response, say_fn, say_a
             say_fn(player_index, "Time recorded successfully!")
         end
 
+        -- is_new_record/server_lb are server-scoped (the submitting server only); global_lb and
+        -- pb (personal_best) are computed across every server the player has played on - see
+        -- docs/api.md's 2026-07-14 note. Priority for the ONE announcement below: a global
+        -- record beats a server record beats a plain personal best.
         local is_new_record = (type(resp) == "table" and resp.isNewRecord) or (type(payload) == "table" and payload.isNewRecord)
         local lap_time = (type(resp) == "table" and resp.lapTime) or (type(payload) == "table" and payload.lapTime)
+        local lap_time_str = format_time(lap_time)
 
-        local lb = (type(payload) == "table" and payload.leaderboardPosition) or resp.position or payload.position
-        if type(lb) == "table" and lb.position then
-            if lb.position == 1 and is_new_record then
-                local player_name = Encoding.toutf8(get_var_fn(player_index, "$name"))
-                local time_val = lap_time or lb.top_time or "?"
-                say_all_fn(player_name .. " set a new lap record: " .. time_val .. " seconds!")
-            elseif lb.position == 1 then
-                -- Already the record holder; this lap just didn't beat your own best.
-                say_fn(player_index, "Leaderboard position: #1 (your record stands at " .. (lb.top_time or "?") .. " seconds)")
+        local server_lb = (type(payload) == "table" and payload.leaderboardPosition) or resp.position or payload.position
+        local global_lb = type(payload) == "table" and payload.globalLeaderboardPosition or nil
+        local pb = type(payload) == "table" and payload.personalBest or nil
+
+        local is_global_record = type(global_lb) == "table" and global_lb.position == 1
+                                  and type(pb) == "table" and pb.isNewRecord
+        local is_server_record = type(server_lb) == "table" and server_lb.position == 1 and is_new_record
+        local is_new_pb = type(pb) == "table" and pb.isNewRecord
+
+        if is_global_record then
+            local player_name = Encoding.toutf8(get_var_fn(player_index, "$name"))
+            say_all_fn(player_name .. " set a new GLOBAL record: " .. lap_time_str .. " seconds!")
+        elseif is_server_record then
+            local player_name = Encoding.toutf8(get_var_fn(player_index, "$name"))
+            say_all_fn(player_name .. " set a new SERVER record: " .. lap_time_str .. " seconds!")
+        elseif is_new_pb then
+            if pb.improvement then
+                say_fn(player_index, string.format("New personal best: %s seconds (-%.2f)", lap_time_str, tonumber(pb.improvement) or 0))
             else
-                local diff_str = tostring(lb.difference or "?")
-                say_fn(player_index, string.format("Leaderboard position: #%d (%.2f sec behind #1)",
-                        lb.position, tonumber(lb.difference) or 0))
+                say_fn(player_index, "New personal best: " .. lap_time_str .. " seconds")
             end
-        elseif type(lb) == "number" then
-            say_fn(player_index, "Leaderboard position: #" .. lb)
+        elseif type(server_lb) == "table" and server_lb.position then
+            -- Not a record/PB this time - the same informational rank line as before,
+            -- just formatted with format_time() now.
+            if server_lb.position == 1 then
+                say_fn(player_index, "Leaderboard position: #1 (your record stands at " .. format_time(server_lb.top_time or 0) .. ")")
+            else
+                say_fn(player_index, string.format("Leaderboard position: #%d (%.2f sec behind #1)",
+                        server_lb.position, tonumber(server_lb.difference) or 0))
+            end
+        elseif type(server_lb) == "number" then
+            say_fn(player_index, "Leaderboard position: #" .. server_lb)
         end
     else
         local error_msg = (type(resp) == "table" and (resp.error or resp.message)) or
@@ -570,8 +600,11 @@ function LapTracker:record_split(playerIndex, cp_id, now)
 end
 
 -- Core idempotent lap finalization
--- Called from OnPlayerScore (normal finish) or OnGameEnd (cleanup)
-function LapTracker:finish_lap(playerIndex, reason, now)
+-- Called from OnPlayerScore (normal finish) or OnGameEnd (cleanup). Says nothing itself about
+-- the outcome - the actual HTTP response (once it arrives, see handle_newtime_response) is the
+-- single source of truth for what the player is told (record/PB/rank), so nothing gets said
+-- here before we even know whether the submission succeeded.
+function LapTracker:finish_lap(playerIndex, now)
     local player = self.players[playerIndex]
 
     -- Guard: must have started, not already submitted
@@ -616,12 +649,6 @@ function LapTracker:finish_lap(playerIndex, reason, now)
     self:submit_lap(playerIndex, best_time, splits)
 
     player:mark_submitted()
-
-    if reason == "score" then
-        say(playerIndex, "Your time of " .. best_time .. " has been recorded.")
-    elseif reason == "game_end" then
-        say(playerIndex, "Final lap submitted: " .. best_time .. " seconds.")
-    end
 
     return true
 end
@@ -784,7 +811,7 @@ function LapTracker:on_player_score(playerIndex, now)
 
     if is_driver then
         player.lap_completed = true
-        self:finish_lap(playerIndex, "score", now)
+        self:finish_lap(playerIndex, now)
     end
 
     -- Always reset warp flag after score event
@@ -798,7 +825,7 @@ function LapTracker:on_game_end(now)
         -- but not yet submitted. Do NOT submit incomplete laps just because game ended
         -- (e.g. a skip vote ending the map mid-race).
         if player_present(i) and self.players[i]:has_valid_lap() and self.players[i].lap_completed then
-            self:finish_lap(i, "game_end", now)
+            self:finish_lap(i, now)
         end
         -- Deliberately NOT resetting player state here (see LAST-LAP-BUG.md): the lap that
         -- wins the race is exactly the lap whose EVENT_SCORE is most likely still in flight
