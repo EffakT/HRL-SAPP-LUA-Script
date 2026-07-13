@@ -104,7 +104,6 @@ local API_URLS = {
 
 local LAP_LIMIT_CONFIG = {
     enabled = true,
-    policy = "dynamic", -- "dynamic" or "grinding"
     announce_changes = true,
     message = "Score limit changed to %s lap%s",
 
@@ -176,6 +175,8 @@ local LAP_LIMIT_CONFIG = {
     -- such as time-based rotation, minimum players, or no-win/endless sessions.
     grinding = {
         score_limit = 50,
+        vote_timeout_seconds = 30,
+        leave_grace_seconds = 30,
     },
 }
 
@@ -188,21 +189,48 @@ function LapLimitManager:new(config)
         active = false,
         current_map = nil,
         current_limit = nil,
+        grind_enabled = false,
+        vote = nil, -- { action = "start"|"stop", player_index, player_hash, expires_at }
+        leave_grace_expires_at = nil,
     }
     setmetatable(obj, self)
     return obj
 end
 
-function LapLimitManager:set_policy(policy)
-    if policy ~= "dynamic" and policy ~= "grinding" then
-        return false
-    end
-    self.config.policy = policy
+function LapLimitManager:get_player_count(player_delta)
+    local count = tonumber(get_var(0, "$pn")) or 0
+    return math.max(0, count + (player_delta or 0))
+end
+
+function LapLimitManager:clear_vote()
+    self.vote = nil
+end
+
+function LapLimitManager:clear_leave_grace()
+    self.leave_grace_expires_at = nil
+end
+
+function LapLimitManager:reset_grind_state()
+    self.grind_enabled = false
+    self:clear_vote()
+    self:clear_leave_grace()
+end
+
+function LapLimitManager:set_grinding(enabled, actor_name)
+    self.grind_enabled = enabled and true or false
+    self:clear_vote()
+    self:clear_leave_grace()
     self.current_limit = nil
+
     if self.active then
         self:update()
     end
-    return true
+
+    if self.grind_enabled then
+        say_all((actor_name and actor_name .. " started the grind." or "Grinding enabled."))
+    else
+        say_all((actor_name and actor_name .. " ended the grind." or "Grinding disabled."))
+    end
 end
 
 function LapLimitManager:get_dynamic_profile(map_name)
@@ -222,7 +250,7 @@ function LapLimitManager:resolve_dynamic_limit(player_count)
 end
 
 function LapLimitManager:resolve_limit(player_count)
-    if self.config.policy == "grinding" then
+    if self.grind_enabled then
         return tonumber(self.config.grinding.score_limit)
     end
     return self:resolve_dynamic_limit(player_count)
@@ -236,10 +264,7 @@ end
 function LapLimitManager:update(player_delta)
     if not self.config.enabled or not self.active then return end
 
-    local player_count = tonumber(get_var(0, "$pn")) or 0
-    player_count = math.max(0, player_count + (player_delta or 0))
-
-    local limit = self:resolve_limit(player_count)
+    local limit = self:resolve_limit(self:get_player_count(player_delta))
     if limit and limit ~= self.current_limit then
         self.current_limit = limit
         execute_command("scorelimit " .. limit)
@@ -251,23 +276,130 @@ function LapLimitManager:on_game_start(map_name, is_race)
     self.current_map = map_name
     self.current_limit = nil
     self.active = self.config.enabled and is_race or false
+    self:reset_grind_state()
     self:update()
 end
 
 function LapLimitManager:on_game_end()
     self.active = false
     self.current_limit = nil
+    self:reset_grind_state()
 end
 
-function LapLimitManager:on_player_join()
-    -- SAPP's join callback matches the original script's behaviour: $pn already
-    -- reflects the joining player, so no adjustment is required.
+function LapLimitManager:on_player_join(playerIndex)
     self:update()
+
+    if not self.active then
+        return
+    end
+
+    if self.grind_enabled then
+        say(playerIndex, "A grind is currently running. Say 'grind' to vote to stop it.")
+    elseif self.current_limit then
+        say(playerIndex, string.format(
+            "This race is set to %d lap%s.",
+            self.current_limit,
+            self.current_limit ~= 1 and "s" or ""
+        ))
+    end
 end
 
 function LapLimitManager:on_player_quit()
-    -- EVENT_LEAVE fires before $pn drops, so account for the departing player.
+    local remaining = self:get_player_count(-1)
+    self:clear_vote()
+
+    if self.grind_enabled then
+
+        if remaining <= 0 then
+            self:reset_grind_state()
+            return
+        end
+
+        local seconds = tonumber(self.config.grinding.leave_grace_seconds) or 30
+        self.leave_grace_expires_at = os.time() + seconds
+        say_all(string.format("Grind will end in %d seconds; say 'grind' to continue.", seconds))
+        return
+    end
+
     self:update(-1)
+end
+
+function LapLimitManager:begin_vote(playerIndex, action)
+    local name = get_var(playerIndex, "$name")
+    local hash = get_var(playerIndex, "$hash")
+    local timeout = tonumber(self.config.grinding.vote_timeout_seconds) or 30
+
+    self.vote = {
+        action = action,
+        player_index = playerIndex,
+        player_hash = hash,
+        expires_at = os.time() + timeout,
+    }
+
+    if action == "start" then
+        say_all(name .. " wants to start a grind; say 'grind' to vote yes.")
+    else
+        say_all(name .. " wants to stop the grind; say 'grind' to vote yes.")
+    end
+end
+
+function LapLimitManager:handle_grind_chat(playerIndex)
+    if not self.active then
+        say(playerIndex, "Grinding is only available during race games.")
+        return false
+    end
+
+    local now = os.time()
+    local name = get_var(playerIndex, "$name")
+    local hash = get_var(playerIndex, "$hash")
+
+    if self.leave_grace_expires_at then
+        self:clear_leave_grace()
+        say_all(name .. " continued the grind.")
+        return false
+    end
+
+    if self.vote and now >= self.vote.expires_at then
+        self:clear_vote()
+    end
+
+    local player_count = self:get_player_count()
+    local action = self.grind_enabled and "stop" or "start"
+
+    if player_count <= 1 then
+        self:set_grinding(not self.grind_enabled, name)
+        return false
+    end
+
+    if not self.vote or self.vote.action ~= action then
+        self:begin_vote(playerIndex, action)
+        return false
+    end
+
+    if self.vote.player_hash == hash then
+        say(playerIndex, "Another player must say 'grind' to confirm the vote.")
+        return false
+    end
+
+    self:set_grinding(action == "start", name)
+    return false
+end
+
+function LapLimitManager:on_tick()
+    local now = os.time()
+
+    if self.vote and now >= self.vote.expires_at then
+        local action = self.vote.action
+        self:clear_vote()
+        say_all("The vote to " .. action .. " the grind expired.")
+    end
+
+    if self.leave_grace_expires_at and now >= self.leave_grace_expires_at then
+        self:clear_leave_grace()
+        if self.grind_enabled then
+            self:set_grinding(false)
+        end
+    end
 end
 
 -- =============================================================================
@@ -1170,6 +1302,7 @@ end
 
 function HRLApp:on_script_load()
     register_callback(cb['EVENT_COMMAND'], "OnServerCommand")
+    register_callback(cb['EVENT_CHAT'], "OnChat")
     register_callback(cb['EVENT_GAME_START'], "OnGameStart")
     register_callback(cb['EVENT_GAME_END'], "OnGameEnd")
     register_callback(cb['EVENT_JOIN'], "OnPlayerJoin")
@@ -1231,7 +1364,7 @@ function HRLApp:on_player_join(playerIndex)
 
     self.lap_tracker:reset_player(playerIndex)
     self.ping_checker:reset_player(playerIndex)
-    self.lap_limits:on_player_join()
+    self.lap_limits:on_player_join(playerIndex)
 
     say(playerIndex, "This server runs Halo Race Leaderboard.")
     say(playerIndex, "For more information, or to see the leaderboard, go to hrl.effakt.info")
@@ -1261,6 +1394,8 @@ end
 function HRLApp:on_tick()
     local now = get_time()
 
+    self.lap_limits:on_tick()
+
     if not self.allow_warps and self.game_started then
         self.ping_checker:check(self.lap_tracker)
     end
@@ -1278,6 +1413,15 @@ function HRLApp:on_tick()
     if self.hrl_token:should_rotate() then
         self.hrl_token:rotate()
     end
+end
+
+
+function HRLApp:on_chat(playerIndex, message)
+    local normalized = tostring(message or ""):lower():match("^%s*(.-)%s*$")
+    if normalized == "grind" then
+        return self.lap_limits:handle_grind_chat(playerIndex)
+    end
+    return true
 end
 
 function HRLApp:on_server_command(playerIndex, command)
@@ -1359,6 +1503,10 @@ end
 
 function OnTick()
     app:on_tick()
+end
+
+function OnChat(playerIndex, message, chat_type)
+    return app:on_chat(playerIndex, message, chat_type)
 end
 
 function OnServerCommand(playerIndex, command)
