@@ -385,6 +385,23 @@ function LapLimitManager:handle_grind_chat(playerIndex)
     return false
 end
 
+function LapLimitManager:show_status(playerIndex)
+    if not self.active then
+        say(playerIndex, "Current mode: HRL is inactive for this gametype.")
+    elseif self.grind_enabled then
+        local limit = tonumber(self.current_limit) or tonumber(self.config.grinding.score_limit) or 50
+        say(playerIndex, string.format("Current mode: Grind (%d laps)", limit))
+    elseif self.current_limit then
+        say(playerIndex, string.format(
+            "Current mode: Race (%d lap%s)",
+            self.current_limit,
+            self.current_limit ~= 1 and "s" or ""
+        ))
+    else
+        say(playerIndex, "Current mode: Race")
+    end
+end
+
 function LapLimitManager:on_tick()
     local now = os.time()
 
@@ -1416,11 +1433,23 @@ function HRLApp:on_tick()
 end
 
 
+function HRLApp:show_help(playerIndex)
+    say(playerIndex, "=== Halo Race Leaderboard ===")
+    say(playerIndex, "grind - Vote to start or stop a grinding session")
+    self.lap_limits:show_status(playerIndex)
+    say(playerIndex, "Leaderboard: hrl.effakt.info")
+end
+
 function HRLApp:on_chat(playerIndex, message)
     local normalized = tostring(message or ""):lower():match("^%s*(.-)%s*$")
+
     if normalized == "grind" then
         return self.lap_limits:handle_grind_chat(playerIndex)
+    elseif normalized == "help" or normalized == "info" then
+        self:show_help(playerIndex)
+        return false
     end
+
     return true
 end
 
@@ -1432,10 +1461,15 @@ function HRLApp:on_server_command(playerIndex, command)
         i = i + 1
     end
 
-    local cmd = t[1]
+    local cmd = t[1] and t[1]:lower() or ""
 
-    if cmd == "claimplayer" then
-        self:claim_player(playerIndex, t[2])
+    if cmd == "help" or cmd == "info" then
+        self:show_help(playerIndex)
+        return false
+    elseif cmd == "grind" then
+        return self.lap_limits:handle_grind_chat(playerIndex)
+    elseif cmd == "claimplayer" then
+        say(playerIndex, "Player claims are currently disabled.")
         return false
     elseif debug == 1 and cmd == "logtime" then
         -- Debug command: force log time for player 1
