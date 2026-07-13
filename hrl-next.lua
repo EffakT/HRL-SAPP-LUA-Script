@@ -91,6 +91,185 @@ local API_URLS = {
     }
 }
 
+
+-- =============================================================================
+-- LapLimitManager Module: Dynamic race length / grinding policy
+-- =============================================================================
+-- Based on dynamic_race_laps.lua by Jericho Crosby (Chalwk), MIT licensed:
+-- https://github.com/Chalwk/HALO-SCRIPT-PROJECTS
+--
+-- HRL integration and subsequent modifications are kept in this isolated module so
+-- alternative policies (for example long-running "grinding" sessions) can be added
+-- without coupling score-limit decisions to lap tracking or API submission logic.
+
+local LAP_LIMIT_CONFIG = {
+    enabled = true,
+    policy = "dynamic", -- "dynamic" or "grinding"
+    announce_changes = true,
+    message = "Score limit changed to %s lap%s",
+
+    profiles = {
+        default = {
+            { 1,  4,  3 },
+            { 5,  8,  6 },
+            { 9, 12,  9 },
+            { 13, 16, 12 },
+        },
+        technical = {
+            { 1,  4, 12 },
+            { 5, 16, 15 },
+        },
+        medium = {
+            { 1,  4,  8 },
+            { 5,  8, 12 },
+            { 9, 16, 15 },
+        },
+        large = {
+            { 1,  4,  5 },
+            { 5,  8,  8 },
+            { 9, 12, 10 },
+            { 13, 16, 12 },
+        },
+        very_long = {
+            { 1,  4,  3 },
+            { 5,  8,  5 },
+            { 9, 12,  8 },
+            { 13, 16, 10 },
+        },
+        medium_long = {
+            { 1,  4,  6 },
+            { 5,  8,  8 },
+            { 9, 12, 10 },
+            { 13, 16, 12 },
+        },
+    },
+
+    maps = {
+        ['bc_raceway_final_mp'] = 'technical',
+        ['Camtrack-Arena-Race'] = 'technical',
+
+        ['cliffhanger'] = 'medium',
+        ['islandthunder_race'] = 'medium',
+        ['LostCove_Race'] = 'medium',
+
+        ['bloodgulch'] = 'large',
+        ['sidewinder'] = 'large',
+        ['icefields'] = 'large',
+        ['infinity'] = 'large',
+
+        ['gephyrophobia'] = 'very_long',
+        ['New_Mombasa_Race_v2'] = 'very_long',
+
+        ['dangercanyon'] = 'medium_long',
+        ['Gauntlet_Race'] = 'medium_long',
+        ['hypothermia_race'] = 'medium_long',
+        ['mercury_falling'] = 'medium_long',
+        ['Mongoose_Point'] = 'medium_long',
+        ['Cityscape-Adrenaline'] = 'medium_long',
+        ['mystic_mod'] = 'medium_long',
+        ['timberland'] = 'medium_long',
+        ['tsce_multiplayerv1'] = 'medium_long',
+    },
+
+    -- Initial grinding behaviour. This is deliberately a separate policy rather
+    -- than a special case inside dynamic resolution, ready for future additions
+    -- such as time-based rotation, minimum players, or no-win/endless sessions.
+    grinding = {
+        score_limit = 50,
+    },
+}
+
+local LapLimitManager = {}
+LapLimitManager.__index = LapLimitManager
+
+function LapLimitManager:new(config)
+    local obj = {
+        config = config,
+        active = false,
+        current_map = nil,
+        current_limit = nil,
+    }
+    setmetatable(obj, self)
+    return obj
+end
+
+function LapLimitManager:set_policy(policy)
+    if policy ~= "dynamic" and policy ~= "grinding" then
+        return false
+    end
+    self.config.policy = policy
+    self.current_limit = nil
+    if self.active then
+        self:update()
+    end
+    return true
+end
+
+function LapLimitManager:get_dynamic_profile(map_name)
+    local profile_name = self.config.maps[map_name] or "default"
+    return self.config.profiles[profile_name] or self.config.profiles.default
+end
+
+function LapLimitManager:resolve_dynamic_limit(player_count)
+    local profile = self:get_dynamic_profile(self.current_map)
+    for _, range in ipairs(profile) do
+        local min_players, max_players, score_limit = unpack(range)
+        if player_count >= min_players and player_count <= max_players then
+            return score_limit
+        end
+    end
+    return nil
+end
+
+function LapLimitManager:resolve_limit(player_count)
+    if self.config.policy == "grinding" then
+        return tonumber(self.config.grinding.score_limit)
+    end
+    return self:resolve_dynamic_limit(player_count)
+end
+
+function LapLimitManager:announce(limit)
+    if not self.config.announce_changes then return end
+    say_all(string.format(self.config.message, limit, limit ~= 1 and "s" or ""))
+end
+
+function LapLimitManager:update(player_delta)
+    if not self.config.enabled or not self.active then return end
+
+    local player_count = tonumber(get_var(0, "$pn")) or 0
+    player_count = math.max(0, player_count + (player_delta or 0))
+
+    local limit = self:resolve_limit(player_count)
+    if limit and limit ~= self.current_limit then
+        self.current_limit = limit
+        execute_command("scorelimit " .. limit)
+        self:announce(limit)
+    end
+end
+
+function LapLimitManager:on_game_start(map_name, is_race)
+    self.current_map = map_name
+    self.current_limit = nil
+    self.active = self.config.enabled and is_race or false
+    self:update()
+end
+
+function LapLimitManager:on_game_end()
+    self.active = false
+    self.current_limit = nil
+end
+
+function LapLimitManager:on_player_join()
+    -- SAPP's join callback matches the original script's behaviour: $pn already
+    -- reflects the joining player, so no adjustment is required.
+    self:update()
+end
+
+function LapLimitManager:on_player_quit()
+    -- EVENT_LEAVE fires before $pn drops, so account for the departing player.
+    self:update(-1)
+end
+
 -- =============================================================================
 -- Encoding Module: Windows-1252 <-> UTF-8
 -- =============================================================================
@@ -951,6 +1130,7 @@ function HRLApp:new()
     obj.api_client = ApiClient:new()
     obj.lap_tracker = LapTracker:new(obj.race_globals, obj.api_client, obj.hrl_token)
     obj.ping_checker = PingChecker:new()
+    obj.lap_limits = LapLimitManager:new(LAP_LIMIT_CONFIG)
 
     setmetatable(obj, self)
     return obj
@@ -998,6 +1178,7 @@ function HRLApp:on_script_load()
     register_callback(cb['EVENT_TICK'], "OnTick")
 
     self:check_map_and_gametype(true)
+    self.lap_limits:on_game_start(self.current_map, self.race)
 
     self.ping_checker:reset()
 
@@ -1013,6 +1194,7 @@ end
 
 function HRLApp:on_game_start()
     self:check_map_and_gametype(true)
+    self.lap_limits:on_game_start(self.current_map, self.race)
     self.lap_tracker:reset_all()
     self.ping_checker:reset()
 
@@ -1022,6 +1204,8 @@ function HRLApp:on_game_start()
 end
 
 function HRLApp:on_game_end()
+    self.lap_limits:on_game_end()
+
     local now = get_time()
     -- Submit pending laps BEFORE resetting state
     self.lap_tracker:on_game_end(now)
@@ -1047,12 +1231,14 @@ function HRLApp:on_player_join(playerIndex)
 
     self.lap_tracker:reset_player(playerIndex)
     self.ping_checker:reset_player(playerIndex)
+    self.lap_limits:on_player_join()
 
     say(playerIndex, "This server runs Halo Race Leaderboard.")
     say(playerIndex, "For more information, or to see the leaderboard, go to hrl.effakt.info")
 end
 
 function HRLApp:on_player_quit(playerIndex)
+    self.lap_limits:on_player_quit()
     self.lap_tracker:reset_player(playerIndex)
     print(string.format("Player %d quit, reset their data", playerIndex))
 end
