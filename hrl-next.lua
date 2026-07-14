@@ -3,8 +3,10 @@
 -- Addresses: Final lap race condition, AnyOrder bitset tracking,
 --            HTTP request ID collision, tick-relative timeout bugs
 
--- TODO: Find memory address for server_port to automate this step
-server_port = "2304" -- update this with your port. If port is invalid, your server will not be included.
+-- Auto-detected from memory at script load (see HRLApp:detect_server_port) with this
+-- manual value kept as the fallback if detection fails or the address is stale on a
+-- given build. If port is invalid, your server will not be included.
+server_port = "2302"
 
 api_version = "1.11.0.0"
 
@@ -72,6 +74,8 @@ local CONSTANTS = {
     MAX_PLAYERS = 16,
     PING_CHECK_INTERVAL = 30,
     RACE_GLOBALS_OFFSET = 0x44,
+    SERVER_PORT_ADDR_PC = 0x6a1c80, -- verified via scanmem
+    SERVER_PORT_ADDR_CE = 0x626100, -- verified via scanmem across an INTERNAL_PORT change
     PING_THRESHOLD = 100,
     PING_EMA_ALPHA = 0.15,
     PING_EMA_SPIKE_THRESHOLD = 35,
@@ -1317,6 +1321,23 @@ function HRLApp:check_map_and_gametype(is_new_game)
     end
 end
 
+-- Validates the read looks like a real port before trusting it, so a stale/wrong address
+-- on some future build just falls back to the manual server_port instead of submitting
+-- garbage.
+function HRLApp:detect_server_port()
+    local address = (halo_type == "PC") and CONSTANTS.SERVER_PORT_ADDR_PC or CONSTANTS.SERVER_PORT_ADDR_CE
+    local ok, value = pcall(read_dword, address)
+
+    if ok and type(value) == "number" and value > 0 and value <= 65535 then
+        print(string.format("server_port auto-detected as %d at 0x%X (manual value was %s)",
+              value, address, tostring(server_port)))
+        server_port = tostring(value)
+    else
+        print(string.format("server_port auto-detect failed at 0x%X, keeping manual value %s",
+              address, tostring(server_port)))
+    end
+end
+
 function HRLApp:on_script_load()
     register_callback(cb['EVENT_COMMAND'], "OnServerCommand")
     register_callback(cb['EVENT_CHAT'], "OnChat")
@@ -1326,6 +1347,8 @@ function HRLApp:on_script_load()
     register_callback(cb['EVENT_LEAVE'], "OnPlayerQuit")
     register_callback(cb['EVENT_WARP'], "OnWarp")
     register_callback(cb['EVENT_TICK'], "OnTick")
+
+    self:detect_server_port()
 
     self:check_map_and_gametype(true)
     self.lap_limits:on_game_start(self.current_map, self.race)
