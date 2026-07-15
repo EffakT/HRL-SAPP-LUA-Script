@@ -1,14 +1,13 @@
 # Halo Race Leaderboard (HRL) - `hrl.lua`
 
-A SAPP (Server Administration Plugin/Patch) Lua script for Halo PC/CE dedicated
+A SAPP Lua script for Halo PC/CE dedicated
 servers that tracks race lap times, submits them to the HRL web leaderboard,
 and manages dynamic race-length policy. Single-file, table-based module
 architecture.
 
 ## Requirements
 
-- A SAPP-patched Halo PC or Halo CE dedicated server (LuaJIT-based, with FFI
-  support).
+- A SAPP Halo PC or Halo CE dedicated server.
 - A `halo_http` native library providing `http_post`/`http_poll`/`http_free`/
   `http_active` (loaded via `ffi.load`).
 - `json.lua` present alongside the haloded.exe or haloceded.exe (loaded via `loadfile`).
